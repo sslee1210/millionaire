@@ -122,4 +122,4 @@ def pick_sector(raw_info: str, name: str, themes: Optional[List[str]] = None) ->
     if sector:
         return {'sector': sector, 'sectorSource': 'kiwoom-name-keyword', 'themes': themes}
 
-    return {'sector': '기타', 'sectorSource': 'kiwoom-etc-fallback', 'themes': themes}
+    return {'sector': '테마·스몰캡', 'sectorSource': 'broad-fallback-no-etc', 'themes': themes}
