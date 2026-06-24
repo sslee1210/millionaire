@@ -14,6 +14,6 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [millionaire] Starting Kiwoom OpenAPI+ bridge...
-python kiwoom_bridge.py
+echo [millionaire] Starting Kiwoom OpenAPI+ bridge in Kiwoom-only sector mode...
+python kiwoom_bridge_kiwoom_only.py
 pause
