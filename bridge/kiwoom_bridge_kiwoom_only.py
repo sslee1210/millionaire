@@ -1,5 +1,6 @@
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
+import os
 
 import kiwoom_bridge as base
 from kiwoom_amount import normalize_trade_amount_million
@@ -7,6 +8,9 @@ from kiwoom_sector_map import parse_code_list, parse_theme_groups, pick_sector
 
 
 TRADE_AMOUNT_UNIT_POLICY = 'kiwoom-only-price-volume-sanity-normalization'
+
+# Determine once whether Naver sector fallback is enabled.
+ALLOW_NAVER_SECTOR = str(os.getenv('ALLOW_NAVER_SECTOR', '0')).lower() in ('1', 'true', 'yes')
 
 
 class KiwoomOnlyController(base.KiwoomController):
@@ -25,9 +29,14 @@ class KiwoomOnlyController(base.KiwoomController):
             'source': 'Kiwoom OpenAPI+ only',
             'rule': 'raw Kiwoom trade amount is normalized against Kiwoom price * Kiwoom volume only',
         }
+        # Sector mapping metadata. Include Naver fallback in provider and priority if enabled.
+        provider = 'Kiwoom OpenAPI+ with Naver fallback' if ALLOW_NAVER_SECTOR else 'Kiwoom OpenAPI+ only'
+        priority = ['kiwoom-theme', 'kiwoom-master-info', 'kiwoom-name-hint', 'kiwoom-name-keyword']
+        if ALLOW_NAVER_SECTOR:
+            priority.append('naver')
         payload['sectorMapping'] = {
-            'provider': 'Kiwoom OpenAPI+ only',
-            'priority': ['kiwoom-theme', 'kiwoom-master-info', 'kiwoom-name-hint', 'kiwoom-name-keyword'],
+            'provider': provider,
+            'priority': priority,
             'themeLoaded': self.theme_loaded,
             'themeGroupCount': self.theme_group_count,
             'themeCodeCount': len(self.theme_by_code),
@@ -42,12 +51,17 @@ class KiwoomOnlyController(base.KiwoomController):
         stats['themeGroupCount'] = self.theme_group_count
         stats['themeCodeCount'] = len(self.theme_by_code)
         stats['lastThemeRefreshAt'] = self.last_theme_refresh_at
+        # Count unclassified stocks including the broad fallback bucket
         stats['unclassifiedCount'] = sum(
             1 for code in self.registered_codes
-            if self.master.get(code, {}).get('sector') in {'미분류', '기타'}
+            if self.master.get(code, {}).get('sector') in {'미분류', '기타', '테마·스몰캡'}
         )
         stats['tradeAmountUnitPolicy'] = TRADE_AMOUNT_UNIT_POLICY
-        stats['dataBoundary'] = 'Kiwoom OpenAPI+ only: no Naver, no external securities link, no external price parser'
+        # Data boundary description reflecting whether Naver fallback is used
+        if ALLOW_NAVER_SECTOR:
+            stats['dataBoundary'] = 'Kiwoom OpenAPI+ with Naver sector fallback: no external price provider or trade data'
+        else:
+            stats['dataBoundary'] = 'Kiwoom OpenAPI+ only: no Naver, no external securities link, no external price parser'
         return payload
 
     def _ensure_theme_map(self) -> None:
@@ -78,7 +92,8 @@ class KiwoomOnlyController(base.KiwoomController):
             name = self._code_name(code)
             raw_info = str(self.ocx.dynamicCall('GetMasterStockInfo(QString)', code) or '')
             themes = self.theme_by_code.get(code, [])
-            sector_info = pick_sector(raw_info, name, themes)
+            # Pass the code to pick_sector so that Naver fallback can be used if enabled
+            sector_info = pick_sector(raw_info, name, themes, code)
             self.master[code] = {
                 'code': code,
                 'name': name,
