@@ -1,10 +1,7 @@
-import asyncio
-import json
 import os
 import re
 import sys
 import threading
-import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -34,6 +31,7 @@ TR_DELAY_MS = int(os.getenv('TR_DELAY_MS', '750'))
 SCREEN_BASE = int(os.getenv('KIWOOM_SCREEN_BASE', '9100'))
 SCREEN_CAPACITY = int(os.getenv('KIWOOM_SCREEN_CAPACITY', '80'))
 MARKETS = [item.strip() for item in os.getenv('KIWOOM_RANKING_MARKETS', '001,101').split(',') if item.strip()]
+STRICT_REALTIME_ONLY = os.getenv('KIWOOM_STRICT_REALTIME', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
 
 EXCLUDE_NAME_RE = re.compile(r'(ETF|ETN|ELW|스팩|기업인수목적|리츠|KODEX|TIGER|ACE|SOL|RISE|KOSEF|HANARO|KBSTAR|ARIRANG|TIMEFOLIO|히어로즈)', re.I)
 
@@ -61,6 +59,12 @@ def to_int(value: Any) -> int:
     return int(abs(to_number(value)))
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    fallback = '1' if default else '0'
+    value = os.getenv(name, fallback).strip().lower()
+    return value not in {'0', 'false', 'no', 'off'}
+
+
 def parse_master_info(raw: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for token in str(raw or '').split(';'):
@@ -81,7 +85,6 @@ def pick_sector(raw_info: str, name: str) -> str:
         value = info.get(key)
         if value:
             return value
-    # 키움 마스터 정보에서 업종명이 비어 있는 종목은 별도 외부 매핑을 쓰지 않고 미분류 처리한다.
     return '미분류'
 
 
@@ -113,6 +116,9 @@ class KiwoomController(QObject):
         self._tr_loop: Optional[QEventLoop] = None
         self._tr_rows: List[Dict[str, Any]] = []
         self._tr_error: Optional[str] = None
+        self._tr_fields: List[str] = []
+        self._tr_rqname: str = ''
+        self._tr_trcode: str = ''
         self._refreshing = False
 
         self.refresh_signal.connect(self.refresh_candidates)
@@ -137,6 +143,8 @@ class KiwoomController(QObject):
             'quoteCount': len(self.quotes),
             'lastCandidateRefreshAt': self.last_candidate_refresh_at,
             'lastRealEventAt': self.last_real_event_at,
+            'strictRealtimeOnly': STRICT_REALTIME_ONLY,
+            'rankingMarkets': MARKETS,
             'fid': {
                 'price': FID_PRICE,
                 'changeRate': FID_CHANGE_RATE,
@@ -150,13 +158,31 @@ class KiwoomController(QObject):
 
     def snapshot(self, sector_limit: int, stocks_per_sector: int, sort_key: str) -> Dict[str, Any]:
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        realtime_ready = 0
+        provisional_count = 0
+
         for code in self.registered_codes:
-            quote = self.quotes.get(code) or self.candidates.get(code)
+            real_quote = self.quotes.get(code)
+            candidate_quote = self.candidates.get(code)
+            quote = real_quote or candidate_quote
             if not quote:
                 continue
+
             stock = self._normalize_stock(code, quote)
             if stock['excluded']:
                 continue
+
+            if stock['isRealtime']:
+                realtime_ready += 1
+            else:
+                provisional_count += 1
+
+            # 영웅문 일일거래량/거래대금과 맞추는 기본 모드:
+            # 화면 표시 숫자는 주식체결 실시간 FID 13/14가 수신된 종목만 사용한다.
+            # TR 값은 후보 선정용이며, STRICT_REALTIME_ONLY=0일 때만 임시 표시한다.
+            if STRICT_REALTIME_ONLY and not stock['isRealtime']:
+                continue
+
             grouped[stock['sector']].append(stock)
 
         sectors = []
@@ -183,13 +209,18 @@ class KiwoomController(QObject):
             'updatedAt': now_iso(),
             'sort': sort_key,
             'sectors': limited,
+            'message': None if limited else self._empty_message(),
             'stats': {
                 'registeredCount': len(self.registered_codes),
                 'candidateCount': len(self.candidates),
                 'quoteCount': len(self.quotes),
+                'realtimeReadyCount': realtime_ready,
+                'provisionalCount': provisional_count,
+                'visibleStockCount': sum(len(sector['stocks']) for sector in limited),
                 'sectorCount': len(sectors),
                 'maxRealtimeCodes': MAX_REALTIME_CODES,
                 'candidateRefreshMs': CANDIDATE_REFRESH_MS,
+                'strictRealtimeOnly': STRICT_REALTIME_ONLY,
                 'lastCandidateRefreshAt': self.last_candidate_refresh_at,
                 'lastRealEventAt': self.last_real_event_at,
             },
@@ -205,17 +236,24 @@ class KiwoomController(QObject):
         try:
             ranking_rows: Dict[str, Dict[str, Any]] = {}
             for market in MARKETS:
-                self._merge_rank_rows(ranking_rows, self._request_volume_rank(market), 'volumeRank')
+                self._merge_rank_rows(ranking_rows, self._request_volume_rank(market), 'volumeRank', market)
                 pause(TR_DELAY_MS)
-                self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank')
+                self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank', market)
                 pause(TR_DELAY_MS)
 
             ranked = rank_candidates(list(ranking_rows.values()))
             limit = max(1, min(int(max_codes or MAX_REALTIME_CODES), 300))
             selected = ranked[:limit]
+
+            # 후보군은 TR 랭킹으로 만들지만, 화면 기본값은 실시간 FID 수신 종목만 표시한다.
             self.candidates = {item['code']: item for item in selected}
             self._hydrate_master(list(self.candidates.keys()))
             self._subscribe_realtime(list(self.candidates.keys()))
+
+            # 후보군이 바뀌었을 때 기존 실시간 quote 중 등록 대상에서 빠진 종목은 제거한다.
+            selected_codes = set(self.candidates.keys())
+            self.quotes = {code: quote for code, quote in self.quotes.items() if code in selected_codes}
+
             self.last_candidate_refresh_at = now_iso()
             self.last_error = None
         except Exception as exc:
@@ -223,14 +261,16 @@ class KiwoomController(QObject):
         finally:
             self._refreshing = False
 
-    def _merge_rank_rows(self, target: Dict[str, Dict[str, Any]], rows: List[Dict[str, Any]], rank_key: str) -> None:
+    def _merge_rank_rows(self, target: Dict[str, Dict[str, Any]], rows: List[Dict[str, Any]], rank_key: str, market: str) -> None:
         for rank, row in enumerate(rows, start=1):
             code = clean_code(row.get('종목코드') or row.get('code'))
             if not code or code == '000000':
                 continue
+
             name = row.get('종목명') or row.get('name') or self._code_name(code)
             if is_excluded_name(name):
                 continue
+
             item = target.setdefault(code, {
                 'code': code,
                 'name': name,
@@ -238,13 +278,19 @@ class KiwoomController(QObject):
                 'volume': 0,
                 'tradeAmountMillion': 0,
                 'changeRate': 0,
-                'source': 'kiwoom-tr-candidate',
+                'market': market,
+                'isRealtime': False,
+                'source': 'kiwoom-tr-ranking-candidate',
+                'sourceLabel': 'TR후보',
+                'updatedAt': self.last_candidate_refresh_at,
             })
+
             item[rank_key] = min(rank, int(item.get(rank_key, rank))) if item.get(rank_key) else rank
             item['price'] = item['price'] or to_int(row.get('현재가'))
             item['volume'] = max(item.get('volume', 0), to_int(row.get('거래량') or row.get('현재거래량')))
             item['tradeAmountMillion'] = max(item.get('tradeAmountMillion', 0), to_int(row.get('거래대금')))
             item['changeRate'] = item.get('changeRate') or to_number(row.get('등락률'))
+            item['rawTr'] = row
 
     def _request_volume_rank(self, market: str) -> List[Dict[str, Any]]:
         inputs = {
@@ -269,20 +315,27 @@ class KiwoomController(QObject):
     def _request_tr(self, rqname: str, trcode: str, inputs: Dict[str, str], fields: List[str]) -> List[Dict[str, Any]]:
         for key, value in inputs.items():
             self.ocx.dynamicCall('SetInputValue(QString, QString)', key, str(value))
+
         screen = str(SCREEN_BASE + 90)
         self._tr_rows = []
         self._tr_error = None
         self._tr_fields = fields
         self._tr_rqname = rqname
         self._tr_trcode = trcode
+
         result = self.ocx.dynamicCall('CommRqData(QString, QString, int, QString)', rqname, trcode, 0, screen)
-        if int(result) != 0:
+        if int(result or 0) != 0:
             raise RuntimeError(f'CommRqData failed: {trcode} result={result}')
+
         self._tr_loop = QEventLoop()
         QTimer.singleShot(8000, self._tr_loop.quit)
         self._tr_loop.exec_()
         rows = list(self._tr_rows)
+        error = self._tr_error
         self._tr_loop = None
+
+        if error:
+            raise RuntimeError(error)
         return rows
 
     def _hydrate_master(self, codes: List[str]) -> None:
@@ -312,6 +365,7 @@ class KiwoomController(QObject):
         for index, chunk in enumerate(chunks):
             if not chunk:
                 continue
+
             screen = str(SCREEN_BASE + index)
             code_list = ';'.join(chunk)
             result = self.ocx.dynamicCall(
@@ -321,7 +375,7 @@ class KiwoomController(QObject):
                 REAL_FIDS,
                 '0',
             )
-            if int(result) != 0:
+            if int(result or 0) != 0:
                 self.last_error = f'SetRealReg failed screen={screen} result={result}'
             self.screens.append(screen)
             self.registered_codes.extend(chunk)
@@ -331,6 +385,8 @@ class KiwoomController(QObject):
         name = quote.get('name') or master.get('name') or self._code_name(code)
         sector = master.get('sector') or quote.get('sector') or '미분류'
         excluded = bool(master.get('excluded')) or is_excluded_name(name)
+        is_realtime = bool(quote.get('isRealtime'))
+
         return {
             'code': code,
             'name': name,
@@ -342,9 +398,19 @@ class KiwoomController(QObject):
             'tradeVolume': int(quote.get('tradeVolume') or 0),
             'strength': float(quote.get('strength') or 0),
             'updatedAt': quote.get('updatedAt'),
+            'time': quote.get('time'),
             'source': quote.get('source') or 'kiwoom',
+            'sourceLabel': quote.get('sourceLabel') or ('실시간 FID' if is_realtime else 'TR후보'),
+            'isRealtime': is_realtime,
             'excluded': excluded,
         }
+
+    def _empty_message(self) -> str:
+        if STRICT_REALTIME_ONLY and self.registered_codes and not self.quotes:
+            return '실시간 FID 수신 대기 중입니다. 체결이 발생한 종목부터 영웅문 기준 일일 누적거래량/거래대금으로 표시됩니다.'
+        if not self.registered_codes:
+            return '실시간 등록 종목이 아직 없습니다. 후보군 갱신을 기다리거나 /api/refresh를 호출하세요.'
+        return '표시 가능한 종목이 없습니다.'
 
     def _on_event_connect(self, err_code: int) -> None:
         self.login_error = int(err_code)
@@ -376,22 +442,43 @@ class KiwoomController(QObject):
     def _on_receive_real_data(self, code, real_type, real_data) -> None:
         if str(real_type) != '주식체결':
             return
+
         code = clean_code(code)
         master = self.master.get(code, {})
         candidate = self.candidates.get(code, {})
         name = master.get('name') or candidate.get('name') or self._code_name(code)
+
+        raw_price = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_PRICE)
+        raw_change_rate = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_CHANGE_RATE)
+        raw_volume = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_VOLUME)
+        raw_trade_amount = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_TRADE_AMOUNT)
+        raw_trade_volume = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_TRADE_VOLUME)
+        raw_time = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_TIME)
+        raw_strength = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_STRENGTH)
+
         quote = {
             'code': code,
             'name': name,
-            'price': to_int(self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_PRICE)),
-            'changeRate': to_number(self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_CHANGE_RATE)),
-            'volume': to_int(self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_VOLUME)),
-            'tradeAmountMillion': to_int(self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_TRADE_AMOUNT)),
-            'tradeVolume': to_int(self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_TRADE_VOLUME)),
-            'time': str(self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_TIME) or '').strip(),
-            'strength': to_number(self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_STRENGTH)),
+            'price': to_int(raw_price),
+            'changeRate': to_number(raw_change_rate),
+            'volume': to_int(raw_volume),
+            'tradeAmountMillion': to_int(raw_trade_amount),
+            'tradeVolume': to_int(raw_trade_volume),
+            'time': str(raw_time or '').strip(),
+            'strength': to_number(raw_strength),
             'updatedAt': now_iso(),
-            'source': 'kiwoom-realtime-fid',
+            'source': 'kiwoom-realtime-fid-stock-trade',
+            'sourceLabel': '실시간 FID',
+            'isRealtime': True,
+            'rawRealtime': {
+                'price': str(raw_price or '').strip(),
+                'changeRate': str(raw_change_rate or '').strip(),
+                'volume': str(raw_volume or '').strip(),
+                'tradeAmount': str(raw_trade_amount or '').strip(),
+                'tradeVolume': str(raw_trade_volume or '').strip(),
+                'time': str(raw_time or '').strip(),
+                'strength': str(raw_strength or '').strip(),
+            },
         }
         self.quotes[code] = quote
         self.last_real_event_at = quote['updatedAt']
@@ -418,9 +505,10 @@ def rank_candidates(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         volume_rank = int(item.get('volumeRank') or 9999)
         amount = int(item.get('tradeAmountMillion') or 0)
         volume = int(item.get('volume') or 0)
-        return (-(10000 - amount_rank) - (10000 - volume_rank), -amount, -volume)
 
-    # score가 작을수록 우선순위가 높다.
+        # 거래대금/거래량 랭킹 후보를 동시에 잡되, 거래대금 랭킹을 우선한다.
+        return (amount_rank, volume_rank, -amount, -volume)
+
     return sorted(rows, key=score)
 
 
@@ -464,6 +552,20 @@ def snapshot(
         controller.refresh_signal.emit(maxRealtimeCodes)
     sort_key = 'volume' if sort == 'volume' else 'tradeAmount'
     return controller.snapshot(max(1, sectorLimit), max(1, stocksPerSector), sort_key)
+
+
+@api.get('/debug/{code}')
+def debug_code(code: str) -> Dict[str, Any]:
+    if controller is None:
+        return {'ok': False, 'error': 'controller not ready'}
+    normalized_code = clean_code(code)
+    return {
+        'ok': True,
+        'code': normalized_code,
+        'master': controller.master.get(normalized_code),
+        'candidate': controller.candidates.get(normalized_code),
+        'quote': controller.quotes.get(normalized_code),
+    }
 
 
 @api.post('/refresh')
