@@ -1,3 +1,3 @@
 # Kiwoom Only
 
-This repository must use Kiwoom OpenAPI+ only.
+This repository uses Kiwoom OpenAPI+ only.
