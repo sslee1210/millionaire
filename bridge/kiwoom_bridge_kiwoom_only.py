@@ -1,53 +1,12 @@
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import kiwoom_bridge as base
+from kiwoom_amount import normalize_trade_amount_million
 from kiwoom_sector_map import parse_code_list, parse_theme_groups, pick_sector
 
 
-TRADE_AMOUNT_UNIT_POLICY = 'million-krw-with-price-volume-sanity-check'
-
-
-def normalize_trade_amount_million(raw_value: Any, price: int = 0, volume: int = 0) -> Tuple[int, Dict[str, Any]]:
-    """Return trade amount in million KRW.
-
-    Kiwoom TR/FID trade amount values are treated as million KRW. Some screens/events can
-    return a value that is 10/100/1000x larger than the price*volume sanity range. In that
-    case we keep the Kiwoom-only source but correct the display unit instead of mixing in
-    any external parser.
-    """
-    raw_million = base.to_int(raw_value)
-    estimated_million = int((int(price or 0) * int(volume or 0)) / 1_000_000) if price and volume else 0
-    normalized = raw_million
-    unit_fix = 'raw-million-krw'
-    ratio: Optional[float] = None
-
-    if raw_million <= 0 and estimated_million > 0:
-        normalized = estimated_million
-        unit_fix = 'estimated-from-price-volume'
-    elif raw_million > 0 and estimated_million > 0:
-        ratio = raw_million / max(estimated_million, 1)
-        if 7.5 <= ratio <= 12.5:
-            normalized = int(round(raw_million / 10))
-            unit_fix = 'raw-divide-10-by-sanity-check'
-        elif 75 <= ratio <= 125:
-            normalized = int(round(raw_million / 100))
-            unit_fix = 'raw-divide-100-by-sanity-check'
-        elif 750 <= ratio <= 1250:
-            normalized = int(round(raw_million / 1000))
-            unit_fix = 'raw-divide-1000-by-sanity-check'
-        elif ratio > 1250:
-            normalized = estimated_million
-            unit_fix = 'estimated-from-price-volume-outlier'
-
-    meta = {
-        'tradeAmountRawMillion': raw_million,
-        'tradeAmountEstimatedMillion': estimated_million,
-        'tradeAmountUnitPolicy': TRADE_AMOUNT_UNIT_POLICY,
-        'tradeAmountUnitFix': unit_fix,
-        'tradeAmountRawToEstimateRatio': ratio,
-    }
-    return max(0, int(normalized or 0)), meta
+TRADE_AMOUNT_UNIT_POLICY = 'kiwoom-only-price-volume-sanity-normalization'
 
 
 class KiwoomOnlyController(base.KiwoomController):
@@ -64,6 +23,7 @@ class KiwoomOnlyController(base.KiwoomController):
             'displayUnit': 'million KRW internally, formatted as KRW 조/억 in UI',
             'policy': TRADE_AMOUNT_UNIT_POLICY,
             'source': 'Kiwoom OpenAPI+ only',
+            'rule': 'raw Kiwoom trade amount is normalized against Kiwoom price * Kiwoom volume only',
         }
         payload['sectorMapping'] = {
             'provider': 'Kiwoom OpenAPI+ only',
@@ -87,6 +47,7 @@ class KiwoomOnlyController(base.KiwoomController):
             if self.master.get(code, {}).get('sector') == '미분류'
         )
         stats['tradeAmountUnitPolicy'] = TRADE_AMOUNT_UNIT_POLICY
+        stats['dataBoundary'] = 'Kiwoom OpenAPI+ only: no Naver, no external securities link, no external price parser'
         return payload
 
     def _ensure_theme_map(self) -> None:
@@ -140,7 +101,12 @@ class KiwoomOnlyController(base.KiwoomController):
 
             price = base.to_int(row.get('현재가'))
             volume = base.to_int(row.get('거래량') or row.get('현재거래량'))
-            trade_amount_million, amount_meta = normalize_trade_amount_million(row.get('거래대금'), price, volume)
+            trade_amount_million, amount_meta = normalize_trade_amount_million(
+                row.get('거래대금'),
+                price=price,
+                volume=volume,
+                source='ranking-tr-opt10030-opt10032',
+            )
 
             item = target.setdefault(code, {
                 'code': code,
@@ -180,12 +146,23 @@ class KiwoomOnlyController(base.KiwoomController):
         name = row.get('종목명') or master.get('name') or candidate.get('name') or self._code_name(normalized_code)
         price = base.to_int(row.get('현재가')) or int(candidate.get('price') or 0)
         volume = base.to_int(row.get('거래량')) or int(candidate.get('volume') or 0)
-        trade_amount_million, amount_meta = normalize_trade_amount_million(row.get('거래대금'), price, volume)
+        trade_amount_million, amount_meta = normalize_trade_amount_million(
+            row.get('거래대금'),
+            price=price,
+            volume=volume,
+            source='current-price-tr-opt10001',
+        )
         amount_from = 'opt10001-normalized'
 
         if trade_amount_million <= 0:
-            trade_amount_million = int(candidate.get('tradeAmountMillion') or 0)
-            amount_from = 'ranking-candidate-normalized'
+            fallback_raw = candidate.get('tradeAmountRaw') or candidate.get('tradeAmountRawMillion') or candidate.get('tradeAmountMillion')
+            trade_amount_million, amount_meta = normalize_trade_amount_million(
+                fallback_raw,
+                price=price,
+                volume=volume,
+                source='ranking-candidate-fallback',
+            )
+            amount_from = 'ranking-candidate-normalized-fallback'
 
         change_rate = base.to_number(row.get('등락률') or row.get('등락율')) or float(candidate.get('changeRate') or 0)
         payload = {
@@ -229,7 +206,12 @@ class KiwoomOnlyController(base.KiwoomController):
 
         price = base.to_int(raw_price)
         volume = base.to_int(raw_volume)
-        trade_amount_million, amount_meta = normalize_trade_amount_million(raw_trade_amount, price, volume)
+        trade_amount_million, amount_meta = normalize_trade_amount_million(
+            raw_trade_amount,
+            price=price,
+            volume=volume,
+            source='realtime-fid-14',
+        )
 
         quote = {
             'code': code,
@@ -268,9 +250,11 @@ class KiwoomOnlyController(base.KiwoomController):
         stock['themes'] = master.get('themes') or []
         stock['tradeAmountSource'] = quote.get('tradeAmountSource')
         stock['tradeAmountUnitFix'] = quote.get('tradeAmountUnitFix')
-        stock['tradeAmountRawMillion'] = quote.get('tradeAmountRawMillion')
+        stock['tradeAmountRaw'] = quote.get('tradeAmountRaw')
+        stock['tradeAmountRawField'] = quote.get('tradeAmountRawField')
+        stock['tradeAmountRawMillion'] = quote.get('tradeAmountRaw')
         stock['tradeAmountEstimatedMillion'] = quote.get('tradeAmountEstimatedMillion')
-        stock['tradeAmountRawToEstimateRatio'] = quote.get('tradeAmountRawToEstimateRatio')
+        stock['tradeAmountSelectedToEstimateRatio'] = quote.get('tradeAmountSelectedToEstimateRatio')
         return stock
 
 
