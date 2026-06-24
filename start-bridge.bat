@@ -2,6 +2,18 @@
 setlocal
 cd /d %~dp0
 
+rem Kiwoom-only high-coverage defaults.
+rem TR calls are intentionally throttled. Realtime FID is used as the main data path.
+set MAX_REALTIME_CODES=220
+set CANDIDATE_REFRESH_MS=90000
+set CURRENT_QUOTE_POLL_MS=45000
+set CURRENT_QUOTE_BATCH_LIMIT=25
+set TR_DELAY_MS=900
+set FLOW_WINDOWS_SEC=60,180
+set FLOW_AMOUNT_THRESHOLD_MILLION=1000
+set FLOW_EVENT_TTL_SEC=900
+
+
 echo [millionaire] Preparing Kiwoom OpenAPI+ bridge dependencies...
 cd bridge
 
@@ -14,6 +26,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [millionaire] Starting Kiwoom OpenAPI+ bridge in Kiwoom-only sector mode...
-python kiwoom_bridge_kiwoom_only.py
+echo [millionaire] Starting Kiwoom OpenAPI+ bridge with realtime amount-flow alerts...
+echo [millionaire] MAX_REALTIME_CODES=%MAX_REALTIME_CODES% / ranking refresh=%CANDIDATE_REFRESH_MS%ms / current TR batch=%CURRENT_QUOTE_BATCH_LIMIT%
+python kiwoom_bridge_flow.py
 pause
