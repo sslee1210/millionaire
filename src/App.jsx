@@ -54,7 +54,7 @@ export default function App() {
           <h1>키움 일일 거래량·거래대금 섹터 보드</h1>
           <p className="hero-copy">
             종목명, 현재가, 일일 누적 거래량, 일일 누적 거래대금은 키움 OpenAPI+ 브릿지에서만 가져옵니다.
-            TR은 후보군 갱신용으로 저빈도 사용하고, 표시 숫자는 실시간 FID 수신값으로 갱신합니다.
+            기본값은 영웅문과 맞추기 위해 주식체결 실시간 FID 13/14가 수신된 종목만 화면에 표시합니다.
           </p>
         </div>
         <div className={`status-card ${status}`}>
@@ -67,8 +67,8 @@ export default function App() {
       <section className="toolbar">
         <div className="metric-grid">
           <Metric label="실시간 등록" value={`${fmt(snapshot.stats?.registeredCount)}종목`} />
-          <Metric label="후보 종목" value={`${fmt(snapshot.stats?.candidateCount)}종목`} />
-          <Metric label="섹터 수" value={`${fmt(snapshot.stats?.sectorCount)}개`} />
+          <Metric label="FID 수신" value={`${fmt(snapshot.stats?.realtimeReadyCount)}종목`} />
+          <Metric label="표시 종목" value={`${fmt(snapshot.stats?.visibleStockCount)}종목`} />
           <Metric label="최종 갱신" value={snapshot.updatedAt ? new Date(snapshot.updatedAt).toLocaleTimeString() : '-'} />
         </div>
         <div className="sort-tabs">
@@ -84,11 +84,11 @@ export default function App() {
         </div>
       </section>
 
-      {!snapshot.ok && (
+      {(!snapshot.ok || snapshot.message) && (
         <section className="notice">
-          <strong>키움 브릿지 연결 필요</strong>
+          <strong>{snapshot.ok ? '데이터 수신 상태' : '키움 브릿지 연결 필요'}</strong>
           <p>
-            `start-bridge.bat`을 먼저 실행하고 키움 로그인을 완료하세요. 서버는 브릿지의 `/snapshot`만 읽습니다.
+            {snapshot.message || snapshot.error || '`start-bridge.bat`을 먼저 실행하고 키움 로그인을 완료하세요.'}
           </p>
         </section>
       )}
@@ -139,6 +139,7 @@ export default function App() {
                 <th>등락률</th>
                 <th>일일 거래량</th>
                 <th>일일 거래대금</th>
+                <th>데이터 기준</th>
                 <th>수신</th>
               </tr>
             </thead>
@@ -152,6 +153,11 @@ export default function App() {
                   <td className={Number(stock.changeRate) >= 0 ? 'up' : 'down'}>{fmtRate(stock.changeRate)}</td>
                   <td>{fmt(stock.volume)}</td>
                   <td>{fmtWonFromMillion(stock.tradeAmountMillion)}</td>
+                  <td>
+                    <span className={`source-badge ${stock.isRealtime ? 'realtime' : 'provisional'}`}>
+                      {stock.sourceLabel || (stock.isRealtime ? '실시간 FID' : 'TR후보')}
+                    </span>
+                  </td>
                   <td>{stock.updatedAt ? new Date(stock.updatedAt).toLocaleTimeString() : '-'}</td>
                 </tr>
               ))}
