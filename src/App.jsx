@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 
-const UI_REVISION = 'kiwoom-only-no-external-links-20260624-2';
+const UI_REVISION = 'kiwoom-only-flow-alerts-20260624-3';
 
 const DEFAULT_SNAPSHOT = {
   ok: false,
   sectors: [],
+  flowAlerts: [],
   stats: {},
   provider: 'Kiwoom OpenAPI+ only',
 };
@@ -48,6 +49,8 @@ export default function App() {
     return snapshot.sectors?.find((sector) => sector.name === selectedSector) || snapshot.sectors?.[0] || null;
   }, [snapshot, selectedSector]);
 
+  const flowAlerts = snapshot.flowAlerts || [];
+
   return (
     <main className="app-shell">
       <header className="hero">
@@ -55,7 +58,7 @@ export default function App() {
           <p className="eyebrow">Millionaire · Kiwoom Only · {UI_REVISION}</p>
           <h1>키움 일일 거래량·거래대금 섹터 보드</h1>
           <p className="hero-copy">
-            이 화면은 키움 OpenAPI+ 브릿지 값만 사용합니다. 종목명은 텍스트이며 외부 증권 사이트 링크, 네이버 파싱, 외부 시세 보정은 없습니다.
+            키움 OpenAPI+ 브릿지 값만 사용합니다. 실시간 FID를 우선 사용하고, TR은 제한 회피를 위해 저빈도·순환 방식으로만 호출합니다.
           </p>
         </div>
         <div className={`status-card ${status}`}>
@@ -70,7 +73,7 @@ export default function App() {
           <Metric label="실시간 등록" value={`${fmt(snapshot.stats?.registeredCount)}종목`} />
           <Metric label="FID 수신" value={`${fmt(snapshot.stats?.realtimeReadyCount)}종목`} />
           <Metric label="표시 종목" value={`${fmt(snapshot.stats?.visibleStockCount)}종목`} />
-          <Metric label="최종 갱신" value={snapshot.updatedAt ? new Date(snapshot.updatedAt).toLocaleTimeString() : '-'} />
+          <Metric label="1/3분 10억 감지" value={`${fmt(snapshot.stats?.flowEventCount)}건`} />
         </div>
         <div className="sort-tabs">
           {SORT_OPTIONS.map((option) => (
@@ -84,6 +87,35 @@ export default function App() {
           ))}
         </div>
       </section>
+
+      <section className="runtime-strip">
+        <span>감시 {fmt(snapshot.stats?.maxRealtimeCodes)}종목</span>
+        <span>현재가TR 배치 {fmt(snapshot.stats?.currentQuoteBatchLimit)}종목</span>
+        <span>미분류/기타 {fmt(snapshot.stats?.unclassifiedCount)}종목</span>
+        <span>최종 갱신 {snapshot.updatedAt ? new Date(snapshot.updatedAt).toLocaleTimeString() : '-'}</span>
+      </section>
+
+      {flowAlerts.length > 0 && (
+        <section className="flow-panel">
+          <div className="detail-title compact">
+            <div>
+              <p className="eyebrow">Amount Flow Alert</p>
+              <h2>1분/3분 거래대금 10억 이상</h2>
+            </div>
+            <span>{fmt(flowAlerts.length)}건</span>
+          </div>
+          <div className="flow-list">
+            {flowAlerts.slice(0, 12).map((alert) => (
+              <div key={alert.key} className="flow-card">
+                <strong>{alert.name}</strong>
+                <span>{alert.sector} · {alert.windowLabel}</span>
+                <em>{fmtTradeAmount(alert.tradeAmountMillion)}</em>
+                <small>{fmt(alert.volume)}주 · {fmtPrice(alert.price)} · {alert.detectedAt ? new Date(alert.detectedAt).toLocaleTimeString() : '-'}</small>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {(!snapshot.ok || snapshot.message) && (
         <section className="notice">
@@ -110,10 +142,10 @@ export default function App() {
             </div>
             <div className="stock-mini-list">
               {(sector.stocks || []).slice(0, 5).map((stock, stockIndex) => (
-                <div key={stock.code} className="mini-row">
+                <div key={stock.code} className={`mini-row ${stock.flowHot ? 'hot-flow' : ''}`}>
                   <span>{stockIndex + 1}</span>
                   <strong>{stock.name}</strong>
-                  <em>{sort === 'volume' ? `${fmt(stock.volume)}주` : fmtTradeAmount(stock.tradeAmountMillion)}</em>
+                  <em>{stock.flowHot ? '10억↑' : sort === 'volume' ? `${fmt(stock.volume)}주` : fmtTradeAmount(stock.tradeAmountMillion)}</em>
                 </div>
               ))}
             </div>
@@ -140,13 +172,15 @@ export default function App() {
                 <th>등락률</th>
                 <th>일일 거래량</th>
                 <th>일일 거래대금</th>
+                <th>1분</th>
+                <th>3분</th>
                 <th>데이터 기준</th>
                 <th>수신</th>
               </tr>
             </thead>
             <tbody>
               {(selected?.stocks || []).map((stock, index) => (
-                <tr key={stock.code}>
+                <tr key={stock.code} className={stock.flowHot ? 'hot-row' : ''}>
                   <td>{index + 1}</td>
                   <td className="stock-name">{stock.name}</td>
                   <td>{stock.code}</td>
@@ -154,6 +188,8 @@ export default function App() {
                   <td className={Number(stock.changeRate) >= 0 ? 'up' : 'down'}>{fmtRate(stock.changeRate)}</td>
                   <td>{fmt(stock.volume)}</td>
                   <td title={tradeAmountTitle(stock)}>{fmtTradeAmount(stock.tradeAmountMillion)}</td>
+                  <td>{fmtTradeAmount(stock.flow60sTradeAmountMillion)}</td>
+                  <td>{fmtTradeAmount(stock.flow180sTradeAmountMillion)}</td>
                   <td>
                     <span className={`source-badge ${stock.isRealtime ? 'realtime' : 'provisional'}`} title={stock.tradeAmountUnitFix || ''}>
                       {stock.sourceLabel || (stock.isRealtime ? '실시간 FID' : '키움현재가TR')}
