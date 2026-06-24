@@ -34,7 +34,7 @@ app.get('/api/provider', (req, res) => {
     mode: 'local-bridge',
     bridgeUrl: BRIDGE_URL,
     rankingBasis: 'daily accumulated volume and daily accumulated trading value',
-    numericSource: 'Kiwoom real-time FID only',
+    numericSource: 'Kiwoom real-time FID first, Kiwoom current-price TR fallback',
     excludes: ['ETF', 'ETN', 'ELW', 'SPAC', 'REIT'],
     pollMs: POLL_MS,
     maxRealtimeCodes: DEFAULT_MAX_REALTIME_CODES,
@@ -89,7 +89,8 @@ app.get('/api/stream', async (req, res) => {
   req.on('close', () => clearInterval(timer));
 });
 
-app.get('*', (req, res) => {
+// Express 5 no longer accepts app.get('*', ...). Use middleware fallback instead.
+app.use((req, res) => {
   const indexPath = path.join(distPath, 'index.html');
   if (fs.existsSync(indexPath)) {
     res.sendFile(indexPath);
@@ -160,7 +161,7 @@ function loadDotEnv() {
     const index = trimmed.indexOf('=');
     if (index <= 0) continue;
     const key = trimmed.slice(0, index).trim();
-    const value = trimmed.slice(index + 1).trim().replace(/^['"]|['"]$/g, '');
+    const value = trimmed.slice(index + 1).trim().replace(/^["']|["']$/g, '');
     if (!process.env[key]) process.env[key] = value;
   }
 }
