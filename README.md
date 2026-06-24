@@ -81,6 +81,13 @@ SECTOR_LIMIT=10
 STOCKS_PER_SECTOR=8
 ```
 
+기본 변수 외에 다음 옵션을 제공하여 동작을 세밀하게 조정할 수 있습니다.
+
+- `CURRENT_QUOTE_POLL_MS` / `CURRENT_QUOTE_BATCH_LIMIT` / `TR_DELAY_MS` 등: TR 주기와 일괄 조회 크기 조절
+- `KIWOOM_STRICT_REALTIME`: 1이면 실시간 FID만 사용하고, 0이면 TR 데이터로 보완
+- `KIWOOM_ALLOW_CURRENT_TR_FALLBACK`: 1이면 현재가 조회 실패 시 랭킹 후보에서 fallback
+- **`ALLOW_NAVER_SECTOR`**: `1`로 설정하면 Kiwoom 기반 규칙으로 섹터를 분류하지 못한 경우 네이버 금융 페이지에서 업종명을 추출해 섹터를 보조적으로 지정합니다. 가격·거래량 정보는 여전히 키움 데이터를 사용하며, 이 옵션을 `0`(기본값)으로 두면 네이버 호출을 하지 않습니다.
+
 ## 호출량 제한 회피 방식
 
 전 종목을 계속 조회하지 않습니다.
