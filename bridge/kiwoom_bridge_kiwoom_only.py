@@ -44,7 +44,7 @@ class KiwoomOnlyController(base.KiwoomController):
         stats['lastThemeRefreshAt'] = self.last_theme_refresh_at
         stats['unclassifiedCount'] = sum(
             1 for code in self.registered_codes
-            if self.master.get(code, {}).get('sector') == '미분류'
+            if self.master.get(code, {}).get('sector') in {'미분류', '기타'}
         )
         stats['tradeAmountUnitPolicy'] = TRADE_AMOUNT_UNIT_POLICY
         stats['dataBoundary'] = 'Kiwoom OpenAPI+ only: no Naver, no external securities link, no external price parser'
@@ -259,4 +259,6 @@ class KiwoomOnlyController(base.KiwoomController):
 
 
 base.KiwoomController = KiwoomOnlyController
-base.main()
+
+if __name__ == '__main__':
+    base.main()
