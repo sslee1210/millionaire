@@ -1,5 +1,11 @@
+import os
 import re
+from urllib.request import urlopen, Request
 from typing import Any, Dict, List, Optional, Tuple
+
+# Determine if Naver sector fallback is enabled via environment variable.
+# Set ALLOW_NAVER_SECTOR=1 (or true/yes) to enable scraping of sector information from Naver Finance
+ALLOW_NAVER_SECTOR = str(os.getenv('ALLOW_NAVER_SECTOR', '0')).lower() in ('1', 'true', 'yes')
 
 SECTOR_KEYWORD_RULES: List[Tuple[str, List[str]]] = [
     ('반도체', ['반도체', 'HBM', 'DRAM', 'D램', 'NAND', '낸드', '파운드리', '웨이퍼', '식각', '증착', '노광', 'EUV', 'OSAT', '패키징', '후공정', '전공정', '소부장', '메모리', '비메모리', '시스템반도체', 'CXL', 'PCB', 'FC-BGA', '유리기판']),
@@ -39,87 +45,8 @@ NAME_HINTS: List[Tuple[str, str]] = [
     ('SK텔레콤', '통신·보안'), ('KT', '통신·보안'), ('LG유플러스', '통신·보안'), ('안랩', '통신·보안'),
 ]
 
-
 def parse_master_info(raw: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for token in str(raw or '').split(';'):
         token = token.strip()
-        if not token:
-            continue
-        for sep in ['|', ':', '=']:
-            if sep in token:
-                key, value = token.split(sep, 1)
-                result[key.strip()] = value.strip()
-                break
-    return result
-
-
-def parse_theme_groups(raw_groups: str) -> List[Tuple[str, str]]:
-    groups: List[Tuple[str, str]] = []
-    for token in re.split(r'[;\n\r]+', str(raw_groups or '')):
-        item = token.strip()
-        if not item:
-            continue
-        if '|' in item:
-            theme_id, theme_name = item.split('|', 1)
-        elif '\t' in item:
-            theme_id, theme_name = item.split('\t', 1)
-        else:
-            continue
-        theme_id = theme_id.strip()
-        theme_name = theme_name.strip()
-        if theme_id and theme_name:
-            groups.append((theme_id, theme_name))
-    return groups
-
-
-def parse_code_list(raw_codes: str, clean_code) -> List[str]:
-    codes: List[str] = []
-    for token in re.split(r'[;|,\s]+', str(raw_codes or '')):
-        code = clean_code(token)
-        if code and code != '000000' and code not in codes:
-            codes.append(code)
-    return codes
-
-
-def compact_text(*values: Any) -> str:
-    return ' '.join(str(value or '') for value in values if str(value or '').strip())
-
-
-def sector_from_keywords(text: str) -> Optional[str]:
-    upper_text = str(text or '').upper()
-    for sector, keywords in SECTOR_KEYWORD_RULES:
-        for keyword in keywords:
-            if keyword.upper() in upper_text:
-                return sector
-    return None
-
-
-def sector_from_name_hint(name: str) -> Optional[str]:
-    upper_name = str(name or '').upper()
-    for hint, mapped_sector in NAME_HINTS:
-        if hint.upper() in upper_name:
-            return mapped_sector
-    return None
-
-
-def pick_sector(raw_info: str, name: str, themes: Optional[List[str]] = None) -> Dict[str, Any]:
-    themes = themes or []
-    hint_sector = sector_from_name_hint(name)
-    if hint_sector:
-        return {'sector': hint_sector, 'sectorSource': 'kiwoom-name-hint', 'themes': themes}
-
-    sector = sector_from_keywords(compact_text(*themes))
-    if sector:
-        return {'sector': sector, 'sectorSource': 'kiwoom-theme', 'themes': themes}
-
-    info = parse_master_info(raw_info)
-    sector = sector_from_keywords(compact_text(*info.values(), raw_info))
-    if sector:
-        return {'sector': sector, 'sectorSource': 'kiwoom-master-info', 'themes': themes}
-
-    sector = sector_from_keywords(name)
-    if sector:
-        return {'sector': sector, 'sectorSource': 'kiwoom-name-keyword', 'themes': themes}
-
-    return {'sector': '테마·스몰캡', 'sectorSource': 'broad-fallback-no-etc', 'themes': themes}
+...
