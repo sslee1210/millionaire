@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
+const UI_REVISION = 'kiwoom-only-no-external-links-20260624-2';
+
 const DEFAULT_SNAPSHOT = {
   ok: false,
   sectors: [],
@@ -50,11 +52,10 @@ export default function App() {
     <main className="app-shell">
       <header className="hero">
         <div>
-          <p className="eyebrow">Millionaire · Kiwoom Only</p>
+          <p className="eyebrow">Millionaire · Kiwoom Only · {UI_REVISION}</p>
           <h1>키움 일일 거래량·거래대금 섹터 보드</h1>
           <p className="hero-copy">
-            종목명, 현재가, 일일 누적 거래량, 일일 누적 거래대금, 섹터 분류는 키움 OpenAPI+ 브릿지 기준만 사용합니다.
-            종목명 클릭 시 외부 증권 사이트로 이동하지 않습니다.
+            이 화면은 키움 OpenAPI+ 브릿지 값만 사용합니다. 종목명은 텍스트이며 외부 증권 사이트 링크, 네이버 파싱, 외부 시세 보정은 없습니다.
           </p>
         </div>
         <div className={`status-card ${status}`}>
