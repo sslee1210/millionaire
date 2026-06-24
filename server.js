@@ -23,9 +23,24 @@ app.use(cors());
 app.use(express.json());
 app.use(morgan('tiny'));
 
+app.use((req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
+
 const distPath = path.join(__dirname, 'dist');
 if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath));
+  app.use(express.static(distPath, {
+    etag: false,
+    lastModified: false,
+    setHeaders: (res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    },
+  }));
 }
 
 app.get('/api/provider', (req, res) => {
@@ -35,6 +50,7 @@ app.get('/api/provider', (req, res) => {
     bridgeUrl: BRIDGE_URL,
     rankingBasis: 'daily accumulated volume and daily accumulated trading value',
     numericSource: 'Kiwoom real-time FID first, Kiwoom current-price TR fallback',
+    dataBoundary: 'No Naver parser, no Naver link, no external securities link, no external market-data parser',
     excludes: ['ETF', 'ETN', 'ELW', 'SPAC', 'REIT'],
     pollMs: POLL_MS,
     maxRealtimeCodes: DEFAULT_MAX_REALTIME_CODES,
@@ -46,6 +62,7 @@ app.get('/api/health', async (req, res) => {
   const health = await bridgeJson('/health');
   res.status(health.ok ? 200 : 503).json({
     server: true,
+    dataBoundary: 'Kiwoom OpenAPI+ only',
     bridge: health,
   });
 });
@@ -67,7 +84,9 @@ app.post('/api/refresh', async (req, res) => {
 app.get('/api/stream', async (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
@@ -102,6 +121,7 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`[millionaire] server listening on http://localhost:${PORT}`);
   console.log(`[millionaire] bridge ${BRIDGE_URL}`);
+  console.log('[millionaire] data boundary: Kiwoom OpenAPI+ only; no Naver links/parsers');
 });
 
 async function fetchSnapshot(query = {}) {
