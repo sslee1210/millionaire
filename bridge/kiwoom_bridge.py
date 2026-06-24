@@ -27,11 +27,14 @@ BRIDGE_HOST = os.getenv('KIWOOM_BRIDGE_HOST', '127.0.0.1')
 BRIDGE_PORT = int(os.getenv('KIWOOM_BRIDGE_PORT', '8765'))
 MAX_REALTIME_CODES = int(os.getenv('MAX_REALTIME_CODES', '80'))
 CANDIDATE_REFRESH_MS = int(os.getenv('CANDIDATE_REFRESH_MS', '60000'))
+CURRENT_QUOTE_POLL_MS = int(os.getenv('CURRENT_QUOTE_POLL_MS', '120000'))
+CURRENT_QUOTE_BATCH_LIMIT = int(os.getenv('CURRENT_QUOTE_BATCH_LIMIT', str(MAX_REALTIME_CODES)))
 TR_DELAY_MS = int(os.getenv('TR_DELAY_MS', '750'))
 SCREEN_BASE = int(os.getenv('KIWOOM_SCREEN_BASE', '9100'))
 SCREEN_CAPACITY = int(os.getenv('KIWOOM_SCREEN_CAPACITY', '80'))
 MARKETS = [item.strip() for item in os.getenv('KIWOOM_RANKING_MARKETS', '001,101').split(',') if item.strip()]
 STRICT_REALTIME_ONLY = os.getenv('KIWOOM_STRICT_REALTIME', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
+ALLOW_CURRENT_TR_FALLBACK = os.getenv('KIWOOM_ALLOW_CURRENT_TR_FALLBACK', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
 
 EXCLUDE_NAME_RE = re.compile(r'(ETF|ETN|ELW|스팩|기업인수목적|리츠|KODEX|TIGER|ACE|SOL|RISE|KOSEF|HANARO|KBSTAR|ARIRANG|TIMEFOLIO|히어로즈)', re.I)
 
@@ -95,6 +98,7 @@ class RefreshRequest(BaseModel):
 
 class KiwoomController(QObject):
     refresh_signal = pyqtSignal(int)
+    current_quote_signal = pyqtSignal(int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -107,10 +111,14 @@ class KiwoomController(QObject):
         self.login_error: Optional[int] = None
         self.last_error: Optional[str] = None
         self.last_candidate_refresh_at: Optional[str] = None
+        self.last_current_quote_refresh_at: Optional[str] = None
         self.last_real_event_at: Optional[str] = None
         self.registered_codes: List[str] = []
         self.screens: List[str] = []
+        # 주식체결 실시간 FID 수신값이다. 정규장 중에는 이 값이 최우선이다.
         self.quotes: Dict[str, Dict[str, Any]] = {}
+        # 장마감/체결 이벤트 공백 구간에서 영웅문 현재가 화면의 일일 누적값에 맞추기 위한 키움 단건 TR 보정값이다.
+        self.current_quotes: Dict[str, Dict[str, Any]] = {}
         self.master: Dict[str, Dict[str, Any]] = {}
         self.candidates: Dict[str, Dict[str, Any]] = {}
         self._tr_loop: Optional[QEventLoop] = None
@@ -120,12 +128,19 @@ class KiwoomController(QObject):
         self._tr_rqname: str = ''
         self._tr_trcode: str = ''
         self._refreshing = False
+        self._refreshing_current = False
 
         self.refresh_signal.connect(self.refresh_candidates)
+        self.current_quote_signal.connect(self.refresh_current_quotes)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.refresh_candidates(MAX_REALTIME_CODES))
         self.timer.start(CANDIDATE_REFRESH_MS)
+
+        self.current_quote_timer = QTimer(self)
+        self.current_quote_timer.timeout.connect(lambda: self.refresh_current_quotes(CURRENT_QUOTE_BATCH_LIMIT))
+        if ALLOW_CURRENT_TR_FALLBACK:
+            self.current_quote_timer.start(max(30000, CURRENT_QUOTE_POLL_MS))
 
     def connect_login(self) -> None:
         self.ocx.dynamicCall('CommConnect()')
@@ -140,10 +155,15 @@ class KiwoomController(QObject):
             'registeredCount': len(self.registered_codes),
             'registeredCodes': self.registered_codes,
             'candidateCount': len(self.candidates),
-            'quoteCount': len(self.quotes),
+            'quoteCount': len(self.quotes) + len(self.current_quotes),
+            'realtimeQuoteCount': len(self.quotes),
+            'currentTrQuoteCount': len(self.current_quotes),
             'lastCandidateRefreshAt': self.last_candidate_refresh_at,
+            'lastCurrentQuoteRefreshAt': self.last_current_quote_refresh_at,
             'lastRealEventAt': self.last_real_event_at,
             'strictRealtimeOnly': STRICT_REALTIME_ONLY,
+            'currentTrFallback': ALLOW_CURRENT_TR_FALLBACK,
+            'currentQuotePollMs': CURRENT_QUOTE_POLL_MS,
             'rankingMarkets': MARKETS,
             'fid': {
                 'price': FID_PRICE,
@@ -159,12 +179,14 @@ class KiwoomController(QObject):
     def snapshot(self, sector_limit: int, stocks_per_sector: int, sort_key: str) -> Dict[str, Any]:
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         realtime_ready = 0
+        current_tr_ready = 0
         provisional_count = 0
 
         for code in self.registered_codes:
             real_quote = self.quotes.get(code)
+            current_quote = self.current_quotes.get(code)
             candidate_quote = self.candidates.get(code)
-            quote = real_quote or candidate_quote
+            quote = real_quote or current_quote or candidate_quote
             if not quote:
                 continue
 
@@ -174,13 +196,14 @@ class KiwoomController(QObject):
 
             if stock['isRealtime']:
                 realtime_ready += 1
+            elif stock['isCurrentTr']:
+                current_tr_ready += 1
             else:
                 provisional_count += 1
 
-            # 영웅문 일일거래량/거래대금과 맞추는 기본 모드:
-            # 화면 표시 숫자는 주식체결 실시간 FID 13/14가 수신된 종목만 사용한다.
-            # TR 값은 후보 선정용이며, STRICT_REALTIME_ONLY=0일 때만 임시 표시한다.
-            if STRICT_REALTIME_ONLY and not stock['isRealtime']:
+            # 화면 표시값은 기본적으로 키움 실시간 FID 또는 키움 현재가 TR만 사용한다.
+            # opt10030/opt10032 랭킹 TR은 후보 선정용이며, KIWOOM_STRICT_REALTIME=0일 때만 임시 표시한다.
+            if STRICT_REALTIME_ONLY and not (stock['isRealtime'] or stock['isCurrentTr']):
                 continue
 
             grouped[stock['sector']].append(stock)
@@ -213,15 +236,21 @@ class KiwoomController(QObject):
             'stats': {
                 'registeredCount': len(self.registered_codes),
                 'candidateCount': len(self.candidates),
-                'quoteCount': len(self.quotes),
+                'quoteCount': len(self.quotes) + len(self.current_quotes),
+                'realtimeQuoteCount': len(self.quotes),
+                'currentTrQuoteCount': len(self.current_quotes),
                 'realtimeReadyCount': realtime_ready,
+                'currentTrReadyCount': current_tr_ready,
                 'provisionalCount': provisional_count,
                 'visibleStockCount': sum(len(sector['stocks']) for sector in limited),
                 'sectorCount': len(sectors),
                 'maxRealtimeCodes': MAX_REALTIME_CODES,
                 'candidateRefreshMs': CANDIDATE_REFRESH_MS,
+                'currentQuotePollMs': CURRENT_QUOTE_POLL_MS,
                 'strictRealtimeOnly': STRICT_REALTIME_ONLY,
+                'currentTrFallback': ALLOW_CURRENT_TR_FALLBACK,
                 'lastCandidateRefreshAt': self.last_candidate_refresh_at,
+                'lastCurrentQuoteRefreshAt': self.last_current_quote_refresh_at,
                 'lastRealEventAt': self.last_real_event_at,
             },
         }
@@ -245,21 +274,44 @@ class KiwoomController(QObject):
             limit = max(1, min(int(max_codes or MAX_REALTIME_CODES), 300))
             selected = ranked[:limit]
 
-            # 후보군은 TR 랭킹으로 만들지만, 화면 기본값은 실시간 FID 수신 종목만 표시한다.
             self.candidates = {item['code']: item for item in selected}
             self._hydrate_master(list(self.candidates.keys()))
             self._subscribe_realtime(list(self.candidates.keys()))
 
-            # 후보군이 바뀌었을 때 기존 실시간 quote 중 등록 대상에서 빠진 종목은 제거한다.
             selected_codes = set(self.candidates.keys())
             self.quotes = {code: quote for code, quote in self.quotes.items() if code in selected_codes}
+            self.current_quotes = {code: quote for code, quote in self.current_quotes.items() if code in selected_codes}
 
             self.last_candidate_refresh_at = now_iso()
             self.last_error = None
+            if ALLOW_CURRENT_TR_FALLBACK:
+                QTimer.singleShot(1000, lambda: self.current_quote_signal.emit(CURRENT_QUOTE_BATCH_LIMIT))
         except Exception as exc:
             self.last_error = str(exc)
         finally:
             self._refreshing = False
+
+    @pyqtSlot(int)
+    def refresh_current_quotes(self, max_codes: int = CURRENT_QUOTE_BATCH_LIMIT) -> None:
+        if not ALLOW_CURRENT_TR_FALLBACK:
+            return
+        if self._refreshing_current:
+            return
+        if not self.login or not self.registered_codes:
+            return
+        self._refreshing_current = True
+        try:
+            limit = max(1, min(int(max_codes or CURRENT_QUOTE_BATCH_LIMIT), len(self.registered_codes)))
+            for code in self.registered_codes[:limit]:
+                quote = self._request_current_quote(code)
+                if quote:
+                    self.current_quotes[code] = quote
+                pause(TR_DELAY_MS)
+            self.last_current_quote_refresh_at = now_iso()
+        except Exception as exc:
+            self.last_error = str(exc)
+        finally:
+            self._refreshing_current = False
 
     def _merge_rank_rows(self, target: Dict[str, Dict[str, Any]], rows: List[Dict[str, Any]], rank_key: str, market: str) -> None:
         for rank, row in enumerate(rows, start=1):
@@ -280,6 +332,7 @@ class KiwoomController(QObject):
                 'changeRate': 0,
                 'market': market,
                 'isRealtime': False,
+                'isCurrentTr': False,
                 'source': 'kiwoom-tr-ranking-candidate',
                 'sourceLabel': 'TR후보',
                 'updatedAt': self.last_candidate_refresh_at,
@@ -289,7 +342,7 @@ class KiwoomController(QObject):
             item['price'] = item['price'] or to_int(row.get('현재가'))
             item['volume'] = max(item.get('volume', 0), to_int(row.get('거래량') or row.get('현재거래량')))
             item['tradeAmountMillion'] = max(item.get('tradeAmountMillion', 0), to_int(row.get('거래대금')))
-            item['changeRate'] = item.get('changeRate') or to_number(row.get('등락률'))
+            item['changeRate'] = item.get('changeRate') or to_number(row.get('등락률') or row.get('등락율'))
             item['rawTr'] = row
 
     def _request_volume_rank(self, market: str) -> List[Dict[str, Any]]:
@@ -301,7 +354,7 @@ class KiwoomController(QObject):
             '거래량구분': '0',
             '가격구분': '0',
         }
-        fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '거래량', '거래대금']
+        fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '현재거래량', '거래대금']
         return self._request_tr('volume_rank', 'opt10030', inputs, fields)
 
     def _request_amount_rank(self, market: str) -> List[Dict[str, Any]]:
@@ -309,8 +362,52 @@ class KiwoomController(QObject):
             '시장구분': market,
             '관리종목포함': '0',
         }
-        fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '거래량', '현재거래량', '거래대금']
+        fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '현재거래량', '거래대금']
         return self._request_tr('amount_rank', 'opt10032', inputs, fields)
+
+    def _request_current_quote(self, code: str) -> Optional[Dict[str, Any]]:
+        normalized_code = clean_code(code)
+        candidate = self.candidates.get(normalized_code, {})
+        inputs = {'종목코드': normalized_code}
+        fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '거래대금']
+        rows = self._request_tr(f'current_quote_{normalized_code}', 'opt10001', inputs, fields)
+        if not rows:
+            return None
+
+        row = rows[0]
+        master = self.master.get(normalized_code, {})
+        name = row.get('종목명') or master.get('name') or candidate.get('name') or self._code_name(normalized_code)
+        price = to_int(row.get('현재가')) or int(candidate.get('price') or 0)
+        volume = to_int(row.get('거래량')) or int(candidate.get('volume') or 0)
+        tr_amount = to_int(row.get('거래대금'))
+        amount_from = 'opt10001'
+        if tr_amount <= 0:
+            tr_amount = int(candidate.get('tradeAmountMillion') or 0)
+            amount_from = 'ranking-candidate'
+        if tr_amount <= 0 and price > 0 and volume > 0:
+            tr_amount = int((price * volume) / 1_000_000)
+            amount_from = 'estimated-price-volume'
+
+        change_rate = to_number(row.get('등락률') or row.get('등락율')) or float(candidate.get('changeRate') or 0)
+        return {
+            'code': normalized_code,
+            'name': name,
+            'price': price,
+            'changeRate': change_rate,
+            'volume': volume,
+            'tradeAmountMillion': tr_amount,
+            'tradeVolume': 0,
+            'time': None,
+            'strength': 0,
+            'updatedAt': now_iso(),
+            'source': 'kiwoom-current-tr-opt10001',
+            'sourceLabel': '키움현재가TR',
+            'isRealtime': False,
+            'isCurrentTr': True,
+            'tradeAmountSource': amount_from,
+            'rawCurrentTr': row,
+            'rankCandidate': candidate,
+        }
 
     def _request_tr(self, rqname: str, trcode: str, inputs: Dict[str, str], fields: List[str]) -> List[Dict[str, Any]]:
         for key, value in inputs.items():
@@ -386,6 +483,7 @@ class KiwoomController(QObject):
         sector = master.get('sector') or quote.get('sector') or '미분류'
         excluded = bool(master.get('excluded')) or is_excluded_name(name)
         is_realtime = bool(quote.get('isRealtime'))
+        is_current_tr = bool(quote.get('isCurrentTr'))
 
         return {
             'code': code,
@@ -400,14 +498,16 @@ class KiwoomController(QObject):
             'updatedAt': quote.get('updatedAt'),
             'time': quote.get('time'),
             'source': quote.get('source') or 'kiwoom',
-            'sourceLabel': quote.get('sourceLabel') or ('실시간 FID' if is_realtime else 'TR후보'),
+            'sourceLabel': quote.get('sourceLabel') or ('실시간 FID' if is_realtime else '키움현재가TR' if is_current_tr else 'TR후보'),
             'isRealtime': is_realtime,
+            'isCurrentTr': is_current_tr,
+            'tradeAmountSource': quote.get('tradeAmountSource'),
             'excluded': excluded,
         }
 
     def _empty_message(self) -> str:
-        if STRICT_REALTIME_ONLY and self.registered_codes and not self.quotes:
-            return '실시간 FID 수신 대기 중입니다. 체결이 발생한 종목부터 영웅문 기준 일일 누적거래량/거래대금으로 표시됩니다.'
+        if STRICT_REALTIME_ONLY and self.registered_codes and not self.quotes and not self.current_quotes:
+            return '키움 실시간 FID/현재가 TR 수신 대기 중입니다. 정규장 중에는 체결 발생 종목부터 실시간 FID로, 장마감 후에는 현재가 TR 보정값으로 표시됩니다.'
         if not self.registered_codes:
             return '실시간 등록 종목이 아직 없습니다. 후보군 갱신을 기다리거나 /api/refresh를 호출하세요.'
         return '표시 가능한 종목이 없습니다.'
@@ -425,12 +525,14 @@ class KiwoomController(QObject):
             repeat_count = int(self.ocx.dynamicCall('GetRepeatCnt(QString, QString)', trcode, rqname))
             rows: List[Dict[str, Any]] = []
             fields = getattr(self, '_tr_fields', [])
-            for row_index in range(repeat_count):
+            row_count = repeat_count if repeat_count > 0 else 1
+            for row_index in range(row_count):
                 row = {}
                 for field in fields:
                     value = self.ocx.dynamicCall('GetCommData(QString, QString, int, QString)', trcode, rqname, row_index, field)
                     row[field] = str(value or '').strip()
-                rows.append(row)
+                if repeat_count > 0 or any(str(value or '').strip() for value in row.values()):
+                    rows.append(row)
             self._tr_rows = rows
         except Exception as exc:
             self._tr_error = str(exc)
@@ -470,6 +572,8 @@ class KiwoomController(QObject):
             'source': 'kiwoom-realtime-fid-stock-trade',
             'sourceLabel': '실시간 FID',
             'isRealtime': True,
+            'isCurrentTr': False,
+            'tradeAmountSource': 'realtime-fid-14',
             'rawRealtime': {
                 'price': str(raw_price or '').strip(),
                 'changeRate': str(raw_change_rate or '').strip(),
@@ -565,6 +669,7 @@ def debug_code(code: str) -> Dict[str, Any]:
         'master': controller.master.get(normalized_code),
         'candidate': controller.candidates.get(normalized_code),
         'quote': controller.quotes.get(normalized_code),
+        'currentTrQuote': controller.current_quotes.get(normalized_code),
     }
 
 
@@ -575,6 +680,14 @@ def refresh(body: RefreshRequest) -> Dict[str, Any]:
     max_codes = int(body.maxRealtimeCodes or MAX_REALTIME_CODES)
     controller.refresh_signal.emit(max_codes)
     return {'ok': True, 'message': 'refresh requested', 'maxRealtimeCodes': max_codes}
+
+
+@api.post('/refresh-current')
+def refresh_current() -> Dict[str, Any]:
+    if controller is None:
+        return {'ok': False, 'error': 'controller not ready'}
+    controller.current_quote_signal.emit(CURRENT_QUOTE_BATCH_LIMIT)
+    return {'ok': True, 'message': 'current quote refresh requested', 'maxCodes': CURRENT_QUOTE_BATCH_LIMIT}
 
 
 def run_api() -> None:
