@@ -53,8 +53,8 @@ export default function App() {
           <p className="eyebrow">Millionaire · Kiwoom Only</p>
           <h1>키움 일일 거래량·거래대금 섹터 보드</h1>
           <p className="hero-copy">
-            종목명, 현재가, 일일 누적 거래량, 일일 누적 거래대금은 키움 OpenAPI+ 브릿지에서만 가져옵니다.
-            기본값은 영웅문과 맞추기 위해 주식체결 실시간 FID 13/14가 수신된 종목만 화면에 표시합니다.
+            종목명, 현재가, 일일 누적 거래량, 일일 누적 거래대금, 섹터 분류는 키움 OpenAPI+ 브릿지 기준만 사용합니다.
+            종목명 클릭 시 외부 증권 사이트로 이동하지 않습니다.
           </p>
         </div>
         <div className={`status-card ${status}`}>
@@ -104,7 +104,7 @@ export default function App() {
               <span className="rank">#{index + 1}</span>
               <div>
                 <h2>{sector.name}</h2>
-                <p>{fmtWonFromMillion(sector.tradeAmountMillion)} · {fmt(sector.volume)}주</p>
+                <p>{fmtTradeAmount(sector.tradeAmountMillion)} · {fmt(sector.volume)}주</p>
               </div>
             </div>
             <div className="stock-mini-list">
@@ -112,7 +112,7 @@ export default function App() {
                 <div key={stock.code} className="mini-row">
                   <span>{stockIndex + 1}</span>
                   <strong>{stock.name}</strong>
-                  <em>{sort === 'volume' ? `${fmt(stock.volume)}주` : fmtWonFromMillion(stock.tradeAmountMillion)}</em>
+                  <em>{sort === 'volume' ? `${fmt(stock.volume)}주` : fmtTradeAmount(stock.tradeAmountMillion)}</em>
                 </div>
               ))}
             </div>
@@ -126,7 +126,7 @@ export default function App() {
             <p className="eyebrow">Selected Sector</p>
             <h2>{selected?.name || '섹터 없음'}</h2>
           </div>
-          {selected && <span>{fmtWonFromMillion(selected.tradeAmountMillion)} / {fmt(selected.volume)}주</span>}
+          {selected && <span>{fmtTradeAmount(selected.tradeAmountMillion)} / {fmt(selected.volume)}주</span>}
         </div>
         <div className="table-wrap">
           <table>
@@ -152,10 +152,10 @@ export default function App() {
                   <td>{fmtPrice(stock.price)}</td>
                   <td className={Number(stock.changeRate) >= 0 ? 'up' : 'down'}>{fmtRate(stock.changeRate)}</td>
                   <td>{fmt(stock.volume)}</td>
-                  <td>{fmtWonFromMillion(stock.tradeAmountMillion)}</td>
+                  <td title={tradeAmountTitle(stock)}>{fmtTradeAmount(stock.tradeAmountMillion)}</td>
                   <td>
-                    <span className={`source-badge ${stock.isRealtime ? 'realtime' : 'provisional'}`}>
-                      {stock.sourceLabel || (stock.isRealtime ? '실시간 FID' : 'TR후보')}
+                    <span className={`source-badge ${stock.isRealtime ? 'realtime' : 'provisional'}`} title={stock.tradeAmountUnitFix || ''}>
+                      {stock.sourceLabel || (stock.isRealtime ? '실시간 FID' : '키움현재가TR')}
                     </span>
                   </td>
                   <td>{stock.updatedAt ? new Date(stock.updatedAt).toLocaleTimeString() : '-'}</td>
@@ -205,10 +205,26 @@ function fmtRate(value) {
   return `${number > 0 ? '+' : ''}${number.toFixed(2)}%`;
 }
 
-function fmtWonFromMillion(value) {
+function fmtTradeAmount(value) {
   const million = Number(value || 0);
   if (!Number.isFinite(million) || million <= 0) return '-';
+
   const eok = million / 100;
-  if (eok >= 1) return `${eok.toLocaleString('ko-KR', { maximumFractionDigits: 1 })}억`;
+  if (eok >= 10000) {
+    const jo = eok / 10000;
+    return `${jo.toLocaleString('ko-KR', { maximumFractionDigits: 2 })}조`;
+  }
+  if (eok >= 1) {
+    return `${eok.toLocaleString('ko-KR', { maximumFractionDigits: 1 })}억`;
+  }
   return `${million.toLocaleString('ko-KR', { maximumFractionDigits: 0 })}백만`;
+}
+
+function tradeAmountTitle(stock) {
+  const parts = [];
+  if (stock?.tradeAmountSource) parts.push(`source=${stock.tradeAmountSource}`);
+  if (stock?.tradeAmountUnitFix) parts.push(`unit=${stock.tradeAmountUnitFix}`);
+  if (stock?.tradeAmountRawMillion != null) parts.push(`rawMillion=${stock.tradeAmountRawMillion}`);
+  if (stock?.tradeAmountEstimatedMillion != null) parts.push(`estimatedMillion=${stock.tradeAmountEstimatedMillion}`);
+  return parts.join(' / ');
 }
