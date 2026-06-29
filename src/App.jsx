@@ -34,6 +34,7 @@ export default function App() {
 
 function DashboardPage() {
   const [snapshot, setSnapshot] = useState(DEFAULT_SNAPSHOT);
+  const [boardMode, setBoardMode] = useState('sector');
   const [sort, setSort] = useState('tradeAmount');
   const [sectorFilter, setSectorFilter] = useState('all');
   const [top20Only, setTop20Only] = useState(false);
@@ -42,11 +43,12 @@ function DashboardPage() {
 
   useEffect(() => {
     setStatus('connecting');
+    const dailyMode = boardMode === 'daily';
     const params = new URLSearchParams({
-      sort: sort === 'volume' ? 'volume' : 'tradeAmount',
-      sectorLimit: '16',
-      stocksPerSector: '5',
-      maxRealtimeCodes: '100',
+      sort: dailyMode ? 'tradeAmount' : sort === 'volume' ? 'volume' : 'tradeAmount',
+      sectorLimit: dailyMode ? '50' : '16',
+      stocksPerSector: dailyMode ? '20' : '5',
+      maxRealtimeCodes: dailyMode ? '180' : '100',
     });
     const source = new EventSource(`/api/stream?${params.toString()}`);
 
@@ -62,7 +64,7 @@ function DashboardPage() {
 
     source.onerror = () => setStatus('stream-error');
     return () => source.close();
-  }, [sort, streamRevision]);
+  }, [sort, boardMode, streamRevision]);
 
   const sectors = useMemo(() => {
     const items = snapshot.sectorFlowBoard?.length ? snapshot.sectorFlowBoard : snapshot.sectors || [];
@@ -76,6 +78,7 @@ function DashboardPage() {
   }, [sectorFilter, sectors]);
 
   const stocks = useMemo(() => flattenStocks(sectors), [sectors]);
+  const dailyRankRows = useMemo(() => sortDashboardStocks(stocks, 'tradeAmount').slice(0, 20), [stocks]);
   const tableRows = useMemo(() => {
     let rows = [...stocks];
     if (sectorFilter !== 'all') rows = rows.filter((stock) => stock.sector === sectorFilter);
@@ -90,9 +93,15 @@ function DashboardPage() {
       .sort((a, b) => number(b.tradeAmountMillion) - number(a.tradeAmountMillion))
       .slice(0, 100)
       .reduce((sum, stock) => sum + number(stock.tradeAmountMillion), 0);
+    const top20TradeAmount = stocks
+      .slice()
+      .sort((a, b) => number(b.tradeAmountMillion) - number(a.tradeAmountMillion))
+      .slice(0, 20)
+      .reduce((sum, stock) => sum + number(stock.tradeAmountMillion), 0);
     return {
       totalTradeAmount,
       topTradeAmount,
+      top20TradeAmount,
       upCount: stocks.filter((stock) => number(stock.changeRate) > 0).length,
       downCount: stocks.filter((stock) => number(stock.changeRate) < 0).length,
     };
@@ -111,6 +120,15 @@ function DashboardPage() {
     }
   };
 
+  const changeBoardMode = (nextMode) => {
+    setBoardMode(nextMode);
+    if (nextMode === 'daily') {
+      setSort('tradeAmount');
+      setSectorFilter('all');
+      setTop20Only(true);
+    }
+  };
+
   return (
     <main className="app-shell wide-shell">
       <header className="page-header">
@@ -126,7 +144,7 @@ function DashboardPage() {
 
         <div className="stat-strip">
           <Metric label="전체 거래대금" value={fmtTradeAmount(stats.totalTradeAmount)} />
-          <Metric label="상위 표시 거래대금" value={`${fmtTradeAmount(stats.topTradeAmount)} (${ratio(stats.topTradeAmount, stats.totalTradeAmount)})`} />
+          <Metric label={boardMode === 'daily' ? '일일 TOP20 거래대금' : '상위 표시 거래대금'} value={boardMode === 'daily' ? `${fmtTradeAmount(stats.top20TradeAmount)} (${ratio(stats.top20TradeAmount, stats.totalTradeAmount)})` : `${fmtTradeAmount(stats.topTradeAmount)} (${ratio(stats.topTradeAmount, stats.totalTradeAmount)})`} />
           <Metric label="상승 종목 수" value={`${fmt(stats.upCount)}개`} tone="up" />
           <Metric label="하락 종목 수" value={`${fmt(stats.downCount)}개`} tone="down" />
           <button className="tool-button" onClick={manualRefresh} type="button" title="새로고침" aria-label="새로고침">↻</button>
@@ -146,30 +164,44 @@ function DashboardPage() {
       <div className="dashboard-layout">
         <div className="main-col">
           <div className="section-heading">
-            <h2>섹터별 거래대금</h2>
-            <span>거래대금 상위 섹터와 대표 종목</span>
+            <h2>{boardMode === 'daily' ? '일일 거래대금순' : '섹터별 거래대금'}</h2>
+            <div className="section-actions">
+              <span>{boardMode === 'daily' ? '키움 당일 누적 거래대금 TOP 종목' : '거래대금 상위 섹터와 대표 종목'}</span>
+              <div className="segmented small">
+                <button className={boardMode === 'sector' ? 'active' : ''} type="button" onClick={() => changeBoardMode('sector')}>섹터 보기</button>
+                <button className={boardMode === 'daily' ? 'active' : ''} type="button" onClick={() => changeBoardMode('daily')}>일일 거래대금순</button>
+              </div>
+            </div>
           </div>
-          <section className="sector-grid" aria-label="섹터별 거래대금 보드">
-            {sectors.length ? sectors.map((sector, index) => (
-              <SectorCard
-                key={sector.name}
-                sector={sector}
-                rank={index + 1}
-                selected={sectorFilter === sector.name}
-                onSelect={() => setSectorFilter(sector.name)}
-              />
-            )) : <EmptyPanel text="키움 실시간/현재가 TR 수신 대기 중입니다." />}
-          </section>
+          {boardMode === 'daily' ? (
+            <section className="daily-rank-grid" aria-label="일일 거래대금 순위">
+              {dailyRankRows.length ? dailyRankRows.map((stock, index) => (
+                <DailyRankCard key={`${stock.code}-${stock.sector}`} stock={stock} rank={index + 1} />
+              )) : <EmptyPanel text="키움 당일 거래대금 순위 수신 대기 중입니다." />}
+            </section>
+          ) : (
+            <section className="sector-grid" aria-label="섹터별 거래대금 보드">
+              {sectors.length ? sectors.map((sector, index) => (
+                <SectorCard
+                  key={sector.name}
+                  sector={sector}
+                  rank={index + 1}
+                  selected={sectorFilter === sector.name}
+                  onSelect={() => setSectorFilter(sector.name)}
+                />
+              )) : <EmptyPanel text="키움 실시간/현재가 TR 수신 대기 중입니다." />}
+            </section>
+          )}
 
           <section className="legend-row">
-            <span>섹터 강도: 거래대금 · 등락률 · 순매수 기준</span>
+            <span>{boardMode === 'daily' ? '일일 거래대금순: 키움 당일 누적 거래대금 기준' : '섹터 강도: 거래대금 · 등락률 · 순매수 기준'}</span>
             <span>급증: 1분/3분 거래대금 {fmtTradeAmount(snapshot.stats?.flowAlertThresholdMillion || 1000)} 이상</span>
           </section>
 
           <section className="table-toolbar">
             <div>
               <p className="eyebrow">Realtime Stock Ranking</p>
-              <h2>상위 종목 리스트</h2>
+              <h2>{boardMode === 'daily' ? '일일 거래대금 상세 리스트' : '상위 종목 리스트'}</h2>
             </div>
             <div className="table-controls">
               <label className="chip"><input type="checkbox" checked={top20Only} onChange={(event) => setTop20Only(event.target.checked)} /> 상위 20개</label>
@@ -177,9 +209,13 @@ function DashboardPage() {
                 <option value="all">전체 섹터</option>
                 {sectors.map((sector) => <option key={sector.name} value={sector.name}>{sector.name}</option>)}
               </select>
-              <select value={sort} onChange={(event) => setSort(event.target.value)}>
-                {DASHBOARD_SORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-              </select>
+              {boardMode === 'daily' ? (
+                <span className="chip fixed-chip">일일 거래대금 기준</span>
+              ) : (
+                <select value={sort} onChange={(event) => setSort(event.target.value)}>
+                  {DASHBOARD_SORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+              )}
             </div>
           </section>
 
@@ -475,6 +511,24 @@ function SectorCard({ sector, rank, selected, onSelect }) {
             <span className={`chg ${tone(stock.changeRate)}`}>{fmtRate(stock.changeRate)}</span>
           </button>
         )) : <div className="mini-empty">수신 대기</div>}
+      </div>
+    </button>
+  );
+}
+
+function DailyRankCard({ stock, rank }) {
+  return (
+    <button className="daily-rank-card" type="button" onClick={() => go(`/stock/${stock.code}`)}>
+      <div className="daily-rank-top">
+        <span className="daily-rank-no">{rank}</span>
+        <span className="sector-tag">{stock.sector || '-'}</span>
+      </div>
+      <div className="daily-rank-name">{stock.name || stock.code}</div>
+      <div className="daily-rank-code">{stock.code}</div>
+      <div className="daily-rank-amount">{fmtTradeAmount(stock.tradeAmountMillion)}</div>
+      <div className="daily-rank-meta">
+        <span className={tone(stock.changeRate)}>{fmtRate(stock.changeRate)}</span>
+        <span>{fmt(stock.volume)}주</span>
       </div>
     </button>
   );
