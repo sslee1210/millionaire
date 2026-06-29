@@ -162,8 +162,8 @@ function DashboardPage() {
           </section>
 
           <section className="legend-row">
-            <span>섹터 점수 = 거래대금 비중 + 상승/하락 강도 + 순매수/체결강도 보정</span>
-            <span><b>★★</b> 1위 · <b>★☆</b> 2~3위 · ☆☆ 그 외</span>
+            <span>섹터 강도: 거래대금 · 등락률 · 순매수 기준</span>
+            <span>급증: 1분/3분 거래대금 {fmtTradeAmount(snapshot.stats?.flowAlertThresholdMillion || 1000)} 이상</span>
           </section>
 
           <section className="table-toolbar">
@@ -198,7 +198,7 @@ function DashboardPage() {
                   <th>1분</th>
                   <th>3분</th>
                   <th>순매수</th>
-                  <th>점수</th>
+                  <th title="거래대금, 등락률, 순매수 기준 강도">강도</th>
                   <th>수신</th>
                 </tr>
               </thead>
@@ -224,6 +224,9 @@ function ScreenerPage() {
   const [payload, setPayload] = useState({ ok: false, items: [], sectors: [], stats: {}, criteria: {} });
   const [sectorFilter, setSectorFilter] = useState('all');
   const [sort, setSort] = useState('recent');
+  const [thresholdRate, setThresholdRate] = useState('10');
+  const [thresholdAmountEok, setThresholdAmountEok] = useState('100');
+  const [maxCodes, setMaxCodes] = useState('20');
   const [loading, setLoading] = useState(true);
   const [revision, setRevision] = useState(0);
 
@@ -233,9 +236,9 @@ function ScreenerPage() {
       sector: sectorFilter,
       sort,
       lookbackDays: '63',
-      thresholdRate: '15',
-      thresholdAmountEok: '500',
-      maxCodes: '40',
+      thresholdRate,
+      thresholdAmountEok,
+      maxCodes,
     });
     setLoading(true);
     fetchJson(`/api/screener?${params.toString()}`)
@@ -249,7 +252,7 @@ function ScreenerPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [sectorFilter, sort, revision]);
+  }, [sectorFilter, sort, thresholdRate, thresholdAmountEok, maxCodes, revision]);
 
   const rows = payload.items || [];
   const sectors = payload.sectors?.length ? payload.sectors : uniqueValues(rows.map((row) => row.sector));
@@ -268,8 +271,9 @@ function ScreenerPage() {
 
       <section className="condition-card">
         <Condition label="탐색 기간" value={`${payload.criteria?.lookbackDays || 63}거래일`} />
-        <Condition label="장대양봉 기준" value={`시가 대비 +${payload.criteria?.thresholdRate || 15}% 이상`} />
-        <Condition label="해당일 거래대금" value={`${fmt(payload.criteria?.thresholdAmountEok || 500)}억원 이상`} />
+        <Condition label="장대양봉 기준" value={`시가 대비 +${payload.criteria?.thresholdRate || thresholdRate}% 이상`} />
+        <Condition label="해당일 거래대금" value={`${fmt(payload.criteria?.thresholdAmountEok || thresholdAmountEok)}억원 이상`} />
+        <Condition label="조회 범위" value={`상위 ${fmt(payload.criteria?.maxCodes || maxCodes)}종목`} />
         <Condition label="데이터" value={providerText(payload.provider)} />
       </section>
 
@@ -288,6 +292,21 @@ function ScreenerPage() {
           <select value={sectorFilter} onChange={(event) => setSectorFilter(event.target.value)}>
             <option value="all">전체 섹터</option>
             {sectors.map((sector) => <option key={sector} value={sector}>{sector}</option>)}
+          </select>
+          <select value={thresholdRate} onChange={(event) => setThresholdRate(event.target.value)} aria-label="상승률 기준">
+            <option value="5">+5% 이상</option>
+            <option value="10">+10% 이상</option>
+            <option value="15">+15% 이상</option>
+          </select>
+          <select value={thresholdAmountEok} onChange={(event) => setThresholdAmountEok(event.target.value)} aria-label="거래대금 기준">
+            <option value="50">50억 이상</option>
+            <option value="100">100억 이상</option>
+            <option value="500">500억 이상</option>
+          </select>
+          <select value={maxCodes} onChange={(event) => setMaxCodes(event.target.value)} aria-label="조회 종목 수">
+            <option value="10">10종목</option>
+            <option value="20">20종목</option>
+            <option value="40">40종목</option>
           </select>
           <select value={sort} onChange={(event) => setSort(event.target.value)}>
             {SCREENER_SORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
@@ -436,7 +455,7 @@ function SectorCard({ sector, rank, selected, onSelect }) {
     <button className={`sector-card ${selected ? 'selected' : ''} ${sector.hotFlowCount ? 'alerting' : ''}`} onClick={onSelect} type="button">
       <div className="sc-top">
         <div className="sc-name"><span className="sc-rank">{rank}</span>{sector.name}</div>
-        {sector.hotFlowCount ? <span className="flow-pill">포착 {fmt(sector.hotFlowCount)}</span> : null}
+        {sector.hotFlowCount ? <span className="flow-pill" title="1분 또는 3분 거래대금 급증">급증 {fmt(sector.hotFlowCount)}</span> : null}
       </div>
       <div className="sc-amount-row">
         <span className="sc-amount">{fmtTradeAmount(sector.tradeAmountMillion)}</span>
@@ -476,7 +495,7 @@ function StockRow({ stock, index }) {
       <td className="num flow-cell">{fmtTradeAmount(stock.flow60sTradeAmountMillion)}</td>
       <td className="num flow-cell">{fmtTradeAmount(stock.flow180sTradeAmountMillion)}</td>
       <td className={`num strong ${tone(stock.netBuyRatio)}`}>{fmtSignedRatio(stock.netBuyRatio)}</td>
-      <td className="num"><span className="score-badge">{fmt(stock.sectorScore)}점</span></td>
+      <td className="num"><span className="score-badge" title="거래대금, 등락률, 순매수 기준 강도">{fmt(stock.sectorScore)}점</span></td>
       <td><span className={`source-badge ${stock.isRealtime ? 'realtime' : 'provisional'}`}>{providerText(stock.sourceLabel || '-')}</span></td>
     </tr>
   );

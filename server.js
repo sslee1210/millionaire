@@ -85,9 +85,9 @@ app.post('/api/refresh', async (req, res) => {
 app.get('/api/screener', async (req, res) => {
   const params = new URLSearchParams();
   params.set('lookbackDays', String(toInt(req.query.lookbackDays, 63)));
-  params.set('thresholdRate', String(toNumber(req.query.thresholdRate, 15)));
-  params.set('thresholdAmountEok', String(toNumber(req.query.thresholdAmountEok, 500)));
-  params.set('maxCodes', String(toInt(req.query.maxCodes, 60)));
+  params.set('thresholdRate', String(toNumber(req.query.thresholdRate, 10)));
+  params.set('thresholdAmountEok', String(toNumber(req.query.thresholdAmountEok, 100)));
+  params.set('maxCodes', String(toInt(req.query.maxCodes, 20)));
   params.set('sort', String(req.query.sort || 'recent'));
   if (req.query.sector && req.query.sector !== 'all') params.set('sector', String(req.query.sector));
 
@@ -105,8 +105,8 @@ app.get('/api/screener', async (req, res) => {
   const fallback = buildSnapshotScreener(snapshot, bridge, {
     sector: String(req.query.sector || 'all'),
     sort: String(req.query.sort || 'recent'),
-    thresholdRate: toNumber(req.query.thresholdRate, 15),
-    thresholdAmountEok: toNumber(req.query.thresholdAmountEok, 500),
+    thresholdRate: toNumber(req.query.thresholdRate, 10),
+    thresholdAmountEok: toNumber(req.query.thresholdAmountEok, 100),
   });
   res.status(snapshot.ok ? 200 : 503).json(fallback);
 });
