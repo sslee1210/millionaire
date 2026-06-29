@@ -412,7 +412,8 @@ class KiwoomController(QObject):
 
         rows = sorted(
             ranking_rows.values(),
-            key=lambda item: (int(item.get('amountRank') or 9999), -int(item.get('tradeAmountMillion') or 0)),
+            key=lambda item: (int(item.get('tradeAmountMillion') or 0), int(item.get('volume') or 0)),
+            reverse=True,
         )
         rows = rows[:max(1, min(int(limit or 50), 100))]
         self._hydrate_master([row['code'] for row in rows])
@@ -433,7 +434,7 @@ class KiwoomController(QObject):
             'provider': 'Kiwoom OpenAPI+ opt10032',
             'updatedAt': now_iso(),
             'exchangeType': EXCHANGE_TYPE,
-            'exchangeTypeLabel': EXCHANGE_TYPE_LABEL,
+            'exchangeTypeLabel': {'1': 'KRX', '2': 'NXT', '3': '통합'}.get(EXCHANGE_TYPE, EXCHANGE_TYPE),
             'criteria': {
                 'rank': 'daily-trade-amount',
                 'limit': limit,
