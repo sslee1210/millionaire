@@ -139,13 +139,18 @@ class KiwoomOnlyController(base.KiwoomController):
             })
 
             item[rank_key] = min(rank, int(item.get(rank_key, rank))) if item.get(rank_key) else rank
-            item['price'] = item['price'] or price
-            item['volume'] = max(item.get('volume', 0), volume)
-            item['tradeAmountMillion'] = max(item.get('tradeAmountMillion', 0), trade_amount_million)
+            item['price'] = price or item['price']
+            if rank_key == 'amountRank':
+                item['volume'] = volume
+                item['tradeAmountMillion'] = trade_amount_million
+            else:
+                item['volume'] = item['volume'] or volume
+                item['tradeAmountMillion'] = item['tradeAmountMillion'] or trade_amount_million
             item['changeRate'] = item.get('changeRate') or base.to_number(row.get('등락률') or row.get('등락율'))
             item['tradeAmountSource'] = 'ranking-tr-normalized'
             item.update(amount_meta)
             item['rawTr'] = row
+            item['rankingBasis'] = 'amount' if rank_key == 'amountRank' else item.get('rankingBasis') or 'volume'
 
     def _request_current_quote(self, code: str) -> Optional[Dict[str, Any]]:
         normalized_code = base.clean_code(code)
@@ -201,6 +206,28 @@ class KiwoomOnlyController(base.KiwoomController):
         }
         payload.update(amount_meta)
         return payload
+
+    def _request_volume_rank(self, market: str) -> List[Dict[str, Any]]:
+        inputs = {
+            '시장구분': market,
+            '정렬구분': '1',
+            '관리종목포함': '0',
+            '신용구분': '0',
+            '거래량구분': '0',
+            '가격구분': '0',
+            '거래소구분': base.EXCHANGE_TYPE,
+        }
+        fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '현재거래량', '거래대금']
+        return self._request_tr('volume_rank', 'opt10030', inputs, fields)
+
+    def _request_amount_rank(self, market: str) -> List[Dict[str, Any]]:
+        inputs = {
+            '시장구분': market,
+            '관리종목포함': '0',
+            '거래소구분': base.EXCHANGE_TYPE,
+        }
+        fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '현재거래량', '거래대금']
+        return self._request_tr('amount_rank', 'opt10032', inputs, fields)
 
     def _on_receive_real_data(self, code, real_type, real_data) -> None:
         if str(real_type) != '주식체결':

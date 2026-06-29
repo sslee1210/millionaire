@@ -4,7 +4,7 @@ import sys
 import threading
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +13,8 @@ from PyQt5.QtCore import QObject, QEventLoop, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QAxContainer import QAxWidget
 import uvicorn
+
+from kiwoom_amount import normalize_trade_amount_million
 
 FID_PRICE = 10
 FID_CHANGE_RATE = 12
@@ -35,6 +37,8 @@ SCREEN_CAPACITY = int(os.getenv('KIWOOM_SCREEN_CAPACITY', '80'))
 MARKETS = [item.strip() for item in os.getenv('KIWOOM_RANKING_MARKETS', '001,101').split(',') if item.strip()]
 STRICT_REALTIME_ONLY = os.getenv('KIWOOM_STRICT_REALTIME', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
 ALLOW_CURRENT_TR_FALLBACK = os.getenv('KIWOOM_ALLOW_CURRENT_TR_FALLBACK', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
+DISPLAY_RANKING_BASELINE = os.getenv('KIWOOM_DISPLAY_RANKING_BASELINE', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
+EXCHANGE_TYPE = os.getenv('KIWOOM_EXCHANGE_TYPE', '3').strip() or '3'
 
 EXCLUDE_NAME_RE = re.compile(r'(ETF|ETN|ELW|스팩|기업인수목적|리츠|KODEX|TIGER|ACE|SOL|RISE|KOSEF|HANARO|KBSTAR|ARIRANG|TIMEFOLIO|히어로즈)', re.I)
 
@@ -99,6 +103,7 @@ class RefreshRequest(BaseModel):
 class KiwoomController(QObject):
     refresh_signal = pyqtSignal(int)
     current_quote_signal = pyqtSignal(int)
+    bridge_call_signal = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -132,6 +137,7 @@ class KiwoomController(QObject):
 
         self.refresh_signal.connect(self.refresh_candidates)
         self.current_quote_signal.connect(self.refresh_current_quotes)
+        self.bridge_call_signal.connect(self._handle_bridge_call)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.refresh_candidates(MAX_REALTIME_CODES))
@@ -141,6 +147,16 @@ class KiwoomController(QObject):
         self.current_quote_timer.timeout.connect(lambda: self.refresh_current_quotes(CURRENT_QUOTE_BATCH_LIMIT))
         if ALLOW_CURRENT_TR_FALLBACK:
             self.current_quote_timer.start(max(30000, CURRENT_QUOTE_POLL_MS))
+
+    @pyqtSlot(object)
+    def _handle_bridge_call(self, payload: Dict[str, Any]) -> None:
+        try:
+            payload['result'] = payload['fn']()
+        except Exception as exc:
+            payload['error'] = str(exc)
+            self.last_error = str(exc)
+        finally:
+            payload['event'].set()
 
     def connect_login(self) -> None:
         self.ocx.dynamicCall('CommConnect()')
@@ -163,6 +179,8 @@ class KiwoomController(QObject):
             'lastRealEventAt': self.last_real_event_at,
             'strictRealtimeOnly': STRICT_REALTIME_ONLY,
             'currentTrFallback': ALLOW_CURRENT_TR_FALLBACK,
+            'exchangeType': EXCHANGE_TYPE,
+            'exchangeTypeLabel': {'1': 'KRX', '2': 'NXT', '3': '통합'}.get(EXCHANGE_TYPE, EXCHANGE_TYPE),
             'currentQuotePollMs': CURRENT_QUOTE_POLL_MS,
             'rankingMarkets': MARKETS,
             'fid': {
@@ -338,12 +356,28 @@ class KiwoomController(QObject):
                 'updatedAt': self.last_candidate_refresh_at,
             })
 
+            row_price = to_int(row.get('현재가'))
+            row_volume = to_int(row.get('거래량') or row.get('현재거래량'))
             item[rank_key] = min(rank, int(item.get(rank_key, rank))) if item.get(rank_key) else rank
-            item['price'] = item['price'] or to_int(row.get('현재가'))
-            item['volume'] = max(item.get('volume', 0), to_int(row.get('거래량') or row.get('현재거래량')))
-            item['tradeAmountMillion'] = max(item.get('tradeAmountMillion', 0), to_int(row.get('거래대금')))
+            item['price'] = row_price or item['price']
+            if rank_key == 'amountRank':
+                item['volume'] = row_volume
+            else:
+                item['volume'] = item['volume'] or row_volume
+            trade_amount_million, amount_meta = normalize_trade_amount_million(
+                row.get('거래대금'),
+                price=item['price'],
+                volume=item['volume'],
+                source='ranking-tr-opt10030-opt10032',
+            )
+            if rank_key == 'amountRank':
+                item['tradeAmountMillion'] = trade_amount_million
+            else:
+                item['tradeAmountMillion'] = item['tradeAmountMillion'] or trade_amount_million
             item['changeRate'] = item.get('changeRate') or to_number(row.get('등락률') or row.get('등락율'))
+            item.update(amount_meta)
             item['rawTr'] = row
+            item['rankingBasis'] = 'amount' if rank_key == 'amountRank' else item.get('rankingBasis') or 'volume'
 
     def _request_volume_rank(self, market: str) -> List[Dict[str, Any]]:
         inputs = {
@@ -353,6 +387,7 @@ class KiwoomController(QObject):
             '신용구분': '0',
             '거래량구분': '0',
             '가격구분': '0',
+            '거래소구분': EXCHANGE_TYPE,
         }
         fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '현재거래량', '거래대금']
         return self._request_tr('volume_rank', 'opt10030', inputs, fields)
@@ -361,6 +396,7 @@ class KiwoomController(QObject):
         inputs = {
             '시장구분': market,
             '관리종목포함': '0',
+            '거래소구분': EXCHANGE_TYPE,
         }
         fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '현재거래량', '거래대금']
         return self._request_tr('amount_rank', 'opt10032', inputs, fields)
@@ -379,17 +415,24 @@ class KiwoomController(QObject):
         name = row.get('종목명') or master.get('name') or candidate.get('name') or self._code_name(normalized_code)
         price = to_int(row.get('현재가')) or int(candidate.get('price') or 0)
         volume = to_int(row.get('거래량')) or int(candidate.get('volume') or 0)
-        tr_amount = to_int(row.get('거래대금'))
-        amount_from = 'opt10001'
+        tr_amount, amount_meta = normalize_trade_amount_million(
+            row.get('거래대금'),
+            price=price,
+            volume=volume,
+            source='current-price-tr-opt10001',
+        )
+        amount_from = 'opt10001-normalized'
         if tr_amount <= 0:
-            tr_amount = int(candidate.get('tradeAmountMillion') or 0)
-            amount_from = 'ranking-candidate'
-        if tr_amount <= 0 and price > 0 and volume > 0:
-            tr_amount = int((price * volume) / 1_000_000)
-            amount_from = 'estimated-price-volume'
+            tr_amount, amount_meta = normalize_trade_amount_million(
+                candidate.get('tradeAmountRaw') or candidate.get('tradeAmountMillion'),
+                price=price,
+                volume=volume,
+                source='ranking-candidate-fallback',
+            )
+            amount_from = 'ranking-candidate-normalized-fallback'
 
         change_rate = to_number(row.get('등락률') or row.get('등락율')) or float(candidate.get('changeRate') or 0)
-        return {
+        payload = {
             'code': normalized_code,
             'name': name,
             'price': price,
@@ -408,6 +451,197 @@ class KiwoomController(QObject):
             'rawCurrentTr': row,
             'rankCandidate': candidate,
         }
+        payload.update(amount_meta)
+        return payload
+
+    def stock_detail(self, code: str, candle_days: int = 80) -> Dict[str, Any]:
+        normalized_code = clean_code(code)
+        self._hydrate_master([normalized_code])
+        cached_quote = self.quotes.get(normalized_code) or self.current_quotes.get(normalized_code) or self.candidates.get(normalized_code)
+        quote = self._request_current_quote(normalized_code) or cached_quote or {}
+        if quote:
+            self.current_quotes[normalized_code] = quote
+        stock = self._normalize_stock(normalized_code, quote) if quote else {
+            'code': normalized_code,
+            'name': self._code_name(normalized_code),
+            'sector': self.master.get(normalized_code, {}).get('sector') or '미분류',
+            'price': 0,
+            'changeRate': 0,
+            'volume': 0,
+            'tradeAmountMillion': 0,
+            'market': '-',
+            'sourceLabel': '키움마스터',
+            'updatedAt': now_iso(),
+        }
+        candles = self.daily_candles(normalized_code, candle_days)
+        return {
+            'ok': True,
+            'provider': 'Kiwoom OpenAPI+',
+            'updatedAt': now_iso(),
+            'stock': stock,
+            'candles': candles,
+            'company': self.company_stub(normalized_code, stock),
+            'financials': {'quarter': [], 'year': []},
+            'peers': self.peer_rows(stock),
+            'news': [],
+            'unavailable': ['뉴스', '상세 기업개요 일부', '재무제표'],
+        }
+
+    def ranking_debug(self, code: str) -> Dict[str, Any]:
+        normalized_code = clean_code(code)
+        amount_rows = []
+        volume_rows = []
+        for market in MARKETS:
+            amount_rows.extend([{**row, '_market': market} for row in self._request_amount_rank(market)])
+            pause(TR_DELAY_MS)
+            volume_rows.extend([{**row, '_market': market} for row in self._request_volume_rank(market)])
+            pause(TR_DELAY_MS)
+
+        def match_row(row: Dict[str, Any]) -> bool:
+            return clean_code(row.get('종목코드') or row.get('code')) == normalized_code
+
+        amount_match = next((row for row in amount_rows if match_row(row)), None)
+        volume_match = next((row for row in volume_rows if match_row(row)), None)
+        candidate = self.candidates.get(normalized_code)
+        quote = self.quotes.get(normalized_code)
+        current = self.current_quotes.get(normalized_code)
+        display_quote = quote or current or candidate or {}
+        display_stock = self._normalize_stock(normalized_code, display_quote) if display_quote else None
+
+        return {
+            'ok': True,
+            'provider': 'Kiwoom OpenAPI+ debug',
+            'updatedAt': now_iso(),
+            'code': normalized_code,
+            'markets': MARKETS,
+            'displayRankingBaseline': DISPLAY_RANKING_BASELINE,
+            'amountRankRaw': amount_match,
+            'volumeRankRaw': volume_match,
+            'candidate': candidate,
+            'currentTrQuote': current,
+            'realtimeQuote': quote,
+            'displayStock': display_stock,
+            'amountTop10': amount_rows[:10],
+            'volumeTop10': volume_rows[:10],
+            'note': 'Compare amountRankRaw.거래량 with Kiwoom [0186] 거래대금상위. If it differs here, bridge TR inputs/session differ from the visible Hero screen. If it matches here but displayStock differs, display merging is wrong.',
+        }
+
+    def daily_candles(self, code: str, days: int = 80) -> List[Dict[str, Any]]:
+        normalized_code = clean_code(code)
+        fields = ['일자', '시가', '고가', '저가', '현재가', '거래량', '거래대금']
+        rows = self._request_tr(
+            f'daily_candles_{normalized_code}',
+            'opt10081',
+            {'종목코드': normalized_code, '기준일자': datetime.now().strftime('%Y%m%d'), '수정주가구분': '1'},
+            fields,
+        )
+        candles: List[Dict[str, Any]] = []
+        for row in rows[:max(1, int(days or 80))]:
+            date_text = str(row.get('일자') or '').strip()
+            open_price = to_int(row.get('시가'))
+            close_price = to_int(row.get('현재가'))
+            volume = to_int(row.get('거래량'))
+            amount_million, amount_meta = normalize_trade_amount_million(
+                row.get('거래대금'),
+                price=close_price,
+                volume=volume,
+                source='daily-candle-tr-opt10081',
+            )
+            candles.append({
+                'date': f'{date_text[:4]}-{date_text[4:6]}-{date_text[6:8]}' if len(date_text) == 8 else date_text,
+                'open': open_price,
+                'high': to_int(row.get('고가')),
+                'low': to_int(row.get('저가')),
+                'close': close_price,
+                'volume': volume,
+                'amountMillion': amount_million,
+                'amountEok': amount_million / 100,
+                'rate': ((close_price - open_price) / open_price * 100) if open_price else 0,
+                'raw': row,
+                **amount_meta,
+            })
+        return sorted(candles, key=lambda item: item.get('date') or '')
+
+    def screener(self, lookback_days: int, threshold_rate: float, threshold_amount_eok: float, max_codes: int, sector: str, sort: str) -> Dict[str, Any]:
+        if not self.login:
+            return {'ok': False, 'error': 'Kiwoom login required'}
+        codes = list(self.registered_codes or self.candidates.keys())
+        if not codes:
+            self.refresh_candidates(max_codes)
+            codes = list(self.registered_codes or self.candidates.keys())
+        rows: List[Dict[str, Any]] = []
+        for code in codes[:max(1, min(int(max_codes or 40), 120))]:
+            self._hydrate_master([code])
+            master = self.master.get(code, {})
+            sector_name = master.get('sector') or '미분류'
+            if sector and sector != 'all' and sector_name != sector:
+                continue
+            candles = self.daily_candles(code, lookback_days + 5)[-lookback_days:]
+            events = [
+                candle for candle in candles
+                if float(candle.get('rate') or 0) >= float(threshold_rate or 15)
+                and float(candle.get('amountEok') or 0) >= float(threshold_amount_eok or 500)
+            ]
+            if not events:
+                pause(TR_DELAY_MS)
+                continue
+            top_event = sorted(events, key=lambda item: (item.get('date') or '', float(item.get('rate') or 0)), reverse=True)[0]
+            quote = self.quotes.get(code) or self.current_quotes.get(code) or self.candidates.get(code) or {}
+            rows.append({
+                'code': code,
+                'name': master.get('name') or quote.get('name') or self._code_name(code),
+                'sector': sector_name,
+                'market': quote.get('market') or '-',
+                'price': quote.get('price') or top_event.get('close') or 0,
+                'changeRate': quote.get('changeRate') or 0,
+                'volume': quote.get('volume') or 0,
+                'amountEok': (quote.get('tradeAmountMillion') or 0) / 100,
+                'events': events,
+                'topEvent': top_event,
+                'candles': candles[-14:],
+                'sourceLabel': '키움일봉TR',
+            })
+            pause(TR_DELAY_MS)
+        rows = sort_screener(rows, sort)
+        return {
+            'ok': True,
+            'provider': 'Kiwoom OpenAPI+ opt10081',
+            'updatedAt': now_iso(),
+            'criteria': {
+                'lookbackDays': lookback_days,
+                'thresholdRate': threshold_rate,
+                'thresholdAmountEok': threshold_amount_eok,
+                'maxCodes': max_codes,
+            },
+            'sectors': sorted({row['sector'] for row in rows}),
+            'items': rows,
+            'stats': screener_stats(rows),
+        }
+
+    def company_stub(self, code: str, stock: Dict[str, Any]) -> Dict[str, Any]:
+        master = self.master.get(code, {})
+        return {
+            'sector': stock.get('sector') or master.get('sector') or '미분류',
+            'market': stock.get('market') or '-',
+            'summary': '키움 OpenAPI+ 기본/시세 데이터로 구성되었습니다. 뉴스, 대표자, 재무 데이터 공급자를 연결하면 상세 정보가 확장됩니다.',
+            'rawInfo': master.get('rawInfo'),
+        }
+
+    def peer_rows(self, stock: Dict[str, Any]) -> List[Dict[str, Any]]:
+        sector = stock.get('sector')
+        rows = []
+        for code in self.registered_codes:
+            quote = self.quotes.get(code) or self.current_quotes.get(code) or self.candidates.get(code)
+            master = self.master.get(code, {})
+            if not quote or master.get('sector') != sector:
+                continue
+            rows.append({
+                'code': code,
+                'name': master.get('name') or quote.get('name') or code,
+                'amountEok': int(quote.get('tradeAmountMillion') or 0) / 100,
+                'me': code == stock.get('code'),
+            })
+        return sorted(rows, key=lambda item: item['amountEok'], reverse=True)[:6]
 
     def _request_tr(self, rqname: str, trcode: str, inputs: Dict[str, str], fields: List[str]) -> List[Dict[str, Any]]:
         for key, value in inputs.items():
@@ -479,13 +713,14 @@ class KiwoomController(QObject):
 
     def _normalize_stock(self, code: str, quote: Dict[str, Any]) -> Dict[str, Any]:
         master = self.master.get(code, {})
+        candidate = self.candidates.get(code, {})
         name = quote.get('name') or master.get('name') or self._code_name(code)
         sector = master.get('sector') or quote.get('sector') or '미분류'
         excluded = bool(master.get('excluded')) or is_excluded_name(name)
         is_realtime = bool(quote.get('isRealtime'))
         is_current_tr = bool(quote.get('isCurrentTr'))
 
-        return {
+        stock = {
             'code': code,
             'name': name,
             'sector': sector,
@@ -504,6 +739,21 @@ class KiwoomController(QObject):
             'tradeAmountSource': quote.get('tradeAmountSource'),
             'excluded': excluded,
         }
+
+        if candidate:
+            stock['rankingVolume'] = int(candidate.get('volume') or 0)
+            stock['rankingTradeAmountMillion'] = int(candidate.get('tradeAmountMillion') or 0)
+            stock['rankingUpdatedAt'] = candidate.get('updatedAt') or self.last_candidate_refresh_at
+            stock['rankingBasis'] = candidate.get('rankingBasis')
+            stock['displayVolumeSource'] = 'ranking-tr-opt10032' if DISPLAY_RANKING_BASELINE else stock['source']
+            stock['displayTradeAmountSource'] = 'ranking-tr-opt10032' if DISPLAY_RANKING_BASELINE else stock.get('tradeAmountSource')
+            if DISPLAY_RANKING_BASELINE:
+                stock['realtimeVolume'] = stock['volume']
+                stock['realtimeTradeAmountMillion'] = stock['tradeAmountMillion']
+                stock['volume'] = stock['rankingVolume'] or stock['volume']
+                stock['tradeAmountMillion'] = stock['rankingTradeAmountMillion'] or stock['tradeAmountMillion']
+                stock['sourceLabel'] = '0186랭킹TR'
+        return stock
 
     def _empty_message(self) -> str:
         if STRICT_REALTIME_ONLY and self.registered_codes and not self.quotes and not self.current_quotes:
@@ -558,13 +808,22 @@ class KiwoomController(QObject):
         raw_time = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_TIME)
         raw_strength = self.ocx.dynamicCall('GetCommRealData(QString, int)', code, FID_STRENGTH)
 
+        price = to_int(raw_price)
+        volume = to_int(raw_volume)
+        trade_amount_million, amount_meta = normalize_trade_amount_million(
+            raw_trade_amount,
+            price=price,
+            volume=volume,
+            source='realtime-fid-14',
+        )
+
         quote = {
             'code': code,
             'name': name,
-            'price': to_int(raw_price),
+            'price': price,
             'changeRate': to_number(raw_change_rate),
-            'volume': to_int(raw_volume),
-            'tradeAmountMillion': to_int(raw_trade_amount),
+            'volume': volume,
+            'tradeAmountMillion': trade_amount_million,
             'tradeVolume': to_int(raw_trade_volume),
             'time': str(raw_time or '').strip(),
             'strength': to_number(raw_strength),
@@ -584,6 +843,7 @@ class KiwoomController(QObject):
                 'strength': str(raw_strength or '').strip(),
             },
         }
+        quote.update(amount_meta)
         self.quotes[code] = quote
         self.last_real_event_at = quote['updatedAt']
 
@@ -620,6 +880,52 @@ def sort_stocks(stocks: List[Dict[str, Any]], sort_key: str) -> List[Dict[str, A
     if sort_key == 'volume':
         return sorted(stocks, key=lambda item: (item['volume'], item['tradeAmountMillion']), reverse=True)
     return sorted(stocks, key=lambda item: (item['tradeAmountMillion'], item['volume']), reverse=True)
+
+
+def sort_screener(rows: List[Dict[str, Any]], sort_key: str) -> List[Dict[str, Any]]:
+    if sort_key == 'rate':
+        return sorted(rows, key=lambda item: float((item.get('topEvent') or {}).get('rate') or 0), reverse=True)
+    if sort_key == 'amount':
+        return sorted(rows, key=lambda item: float((item.get('topEvent') or {}).get('amountEok') or 0), reverse=True)
+    if sort_key == 'count':
+        return sorted(rows, key=lambda item: len(item.get('events') or []), reverse=True)
+    return sorted(rows, key=lambda item: str((item.get('topEvent') or {}).get('date') or ''), reverse=True)
+
+
+def screener_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    events = [event for row in rows for event in row.get('events', [])]
+    rates = [float(event.get('rate') or 0) for event in events]
+    recent_count = 0
+    today = datetime.now().date()
+    for row in rows:
+        for event in row.get('events', []):
+            try:
+                event_date = datetime.strptime(str(event.get('date')), '%Y-%m-%d').date()
+                if (today - event_date).days <= 7:
+                    recent_count += 1
+                    break
+            except ValueError:
+                continue
+    return {
+        'stockCount': len(rows),
+        'eventCount': len(events),
+        'avgRate': sum(rates) / len(rates) if rates else 0,
+        'recentCount': recent_count,
+    }
+
+
+def run_controller_call(fn: Callable[[], Dict[str, Any]], timeout_sec: int = 90) -> Dict[str, Any]:
+    if controller is None:
+        return {'ok': False, 'error': 'controller not ready'}
+    event = threading.Event()
+    payload: Dict[str, Any] = {'fn': fn, 'event': event}
+    controller.bridge_call_signal.emit(payload)
+    if not event.wait(timeout_sec):
+        return {'ok': False, 'error': f'Kiwoom request timed out after {timeout_sec}s'}
+    if payload.get('error'):
+        return {'ok': False, 'error': payload['error']}
+    result = payload.get('result')
+    return result if isinstance(result, dict) else {'ok': True, 'result': result}
 
 
 controller: Optional[KiwoomController] = None
@@ -671,6 +977,55 @@ def debug_code(code: str) -> Dict[str, Any]:
         'quote': controller.quotes.get(normalized_code),
         'currentTrQuote': controller.current_quotes.get(normalized_code),
     }
+
+
+@api.get('/ranking-debug/{code}')
+def ranking_debug(code: str) -> Dict[str, Any]:
+    normalized_code = clean_code(code)
+    return run_controller_call(lambda: controller.ranking_debug(normalized_code), 90)
+
+
+@api.get('/stock/{code}')
+def stock_detail(code: str, candleDays: int = 80) -> Dict[str, Any]:
+    normalized_code = clean_code(code)
+    return run_controller_call(lambda: controller.stock_detail(normalized_code, max(20, min(int(candleDays or 80), 160))), 90)
+
+
+@api.get('/candles/{code}')
+def daily_candles(code: str, days: int = 80) -> Dict[str, Any]:
+    normalized_code = clean_code(code)
+    return run_controller_call(
+        lambda: {
+            'ok': True,
+            'provider': 'Kiwoom OpenAPI+ opt10081',
+            'updatedAt': now_iso(),
+            'code': normalized_code,
+            'candles': controller.daily_candles(normalized_code, max(20, min(int(days or 80), 240))),
+        },
+        90,
+    )
+
+
+@api.get('/screener')
+def screener(
+    lookbackDays: int = 63,
+    thresholdRate: float = 15,
+    thresholdAmountEok: float = 500,
+    maxCodes: int = 40,
+    sector: str = 'all',
+    sort: str = 'recent',
+) -> Dict[str, Any]:
+    return run_controller_call(
+        lambda: controller.screener(
+            max(5, min(int(lookbackDays or 63), 180)),
+            float(thresholdRate or 15),
+            float(thresholdAmountEok or 500),
+            max(1, min(int(maxCodes or 40), 120)),
+            str(sector or 'all'),
+            str(sort or 'recent'),
+        ),
+        max(90, int(maxCodes or 40) * 3),
+    )
 
 
 @api.post('/refresh')
