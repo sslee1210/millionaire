@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 
-const UI_REVISION = 'kiwoom-dashboard-overview-sectorflow-20260624-4';
-
+const UI_REVISION = 'moneyboard-html-kiwoom-20260629-1';
 const DEFAULT_SNAPSHOT = {
   ok: false,
   sectors: [],
@@ -9,254 +8,367 @@ const DEFAULT_SNAPSHOT = {
   flowAlerts: [],
   overview: { items: [] },
   stats: {},
-  provider: 'Kiwoom OpenAPI+ primary',
+  provider: 'Kiwoom OpenAPI+ only',
 };
-
+const MISC_SECTOR_NAMES = new Set(['기타', '미분류', '기타업종', '기타 제조', '기타제조']);
 const SORT_OPTIONS = [
-  { value: 'tradeAmount', label: '거래대금순' },
-  { value: 'volume', label: '거래량순' },
+  { value: 'tradeAmount', label: '거래대금 순' },
+  { value: 'volume', label: '거래량 순' },
+  { value: 'rate', label: '등락률 순' },
+  { value: 'score', label: '섹터 점수 순' },
 ];
 
 export default function App() {
   const [snapshot, setSnapshot] = useState(DEFAULT_SNAPSHOT);
   const [sort, setSort] = useState('tradeAmount');
-  const [selectedSector, setSelectedSector] = useState(null);
+  const [sectorFilter, setSectorFilter] = useState('all');
+  const [top20Only, setTop20Only] = useState(false);
   const [status, setStatus] = useState('connecting');
+  const [streamRevision, setStreamRevision] = useState(0);
 
   useEffect(() => {
     setStatus('connecting');
-    const source = new EventSource(`/api/stream?sort=${sort}`);
+    const params = new URLSearchParams({
+      sort: sort === 'volume' ? 'volume' : 'tradeAmount',
+      sectorLimit: '12',
+      stocksPerSector: '5',
+      maxRealtimeCodes: '80',
+    });
+    const source = new EventSource(`/api/stream?${params.toString()}`);
 
     source.addEventListener('snapshot', (event) => {
-      const next = JSON.parse(event.data);
-      setSnapshot(next);
-      setStatus(next.ok ? 'online' : 'bridge-error');
+      try {
+        const next = JSON.parse(event.data);
+        setSnapshot(next);
+        setStatus(next.ok ? 'online' : 'bridge-error');
+      } catch (error) {
+        setStatus('parse-error');
+      }
     });
 
     source.onerror = () => setStatus('stream-error');
     return () => source.close();
-  }, [sort]);
+  }, [sort, streamRevision]);
+
+  const sectors = useMemo(() => {
+    const items = snapshot.sectorFlowBoard?.length ? snapshot.sectorFlowBoard : snapshot.sectors || [];
+    return items.filter((sector) => !MISC_SECTOR_NAMES.has(String(sector.name || '').trim()));
+  }, [snapshot]);
 
   useEffect(() => {
-    if (!snapshot.sectors?.length) return;
-    if (!selectedSector || !snapshot.sectors.some((sector) => sector.name === selectedSector)) {
-      setSelectedSector(snapshot.sectors[0].name);
+    if (sectorFilter !== 'all' && !sectors.some((sector) => sector.name === sectorFilter)) {
+      setSectorFilter('all');
     }
-  }, [snapshot, selectedSector]);
+  }, [sectorFilter, sectors]);
 
-  const selected = useMemo(() => {
-    return snapshot.sectors?.find((sector) => sector.name === selectedSector) || snapshot.sectors?.[0] || null;
-  }, [snapshot, selectedSector]);
+  const stocks = useMemo(() => {
+    const rows = [];
+    sectors.forEach((sector, sectorIndex) => {
+      (sector.stocks || []).forEach((stock) => {
+        rows.push({
+          ...stock,
+          sector: sector.name,
+          sectorRank: sectorIndex + 1,
+          sectorScore: sector.score ?? calcSectorScore(sector),
+        });
+      });
+    });
+    return rows;
+  }, [sectors]);
 
-  const flowAlerts = snapshot.flowAlerts || [];
-  const sectorBoard = snapshot.sectorFlowBoard?.length ? snapshot.sectorFlowBoard : snapshot.sectors || [];
+  const tableRows = useMemo(() => {
+    let rows = [...stocks];
+    if (sectorFilter !== 'all') rows = rows.filter((stock) => stock.sector === sectorFilter);
+
+    if (sort === 'volume') {
+      rows.sort((a, b) => (Number(b.volume) || 0) - (Number(a.volume) || 0));
+    } else if (sort === 'rate') {
+      rows.sort((a, b) => (Number(b.changeRate) || 0) - (Number(a.changeRate) || 0));
+    } else if (sort === 'score') {
+      rows.sort((a, b) => (Number(b.sectorScore) || 0) - (Number(a.sectorScore) || 0));
+    } else {
+      rows.sort((a, b) => (Number(b.tradeAmountMillion) || 0) - (Number(a.tradeAmountMillion) || 0));
+    }
+    return rows.slice(0, top20Only ? 20 : 100);
+  }, [stocks, sectorFilter, sort, top20Only]);
+
+  const stats = useMemo(() => {
+    const totalTradeAmount = sectors.reduce((sum, sector) => sum + (Number(sector.tradeAmountMillion) || 0), 0);
+    const topTradeAmount = stocks
+      .slice()
+      .sort((a, b) => (Number(b.tradeAmountMillion) || 0) - (Number(a.tradeAmountMillion) || 0))
+      .slice(0, 100)
+      .reduce((sum, stock) => sum + (Number(stock.tradeAmountMillion) || 0), 0);
+    const upCount = stocks.filter((stock) => Number(stock.changeRate) > 0).length;
+    const downCount = stocks.filter((stock) => Number(stock.changeRate) < 0).length;
+    return { totalTradeAmount, topTradeAmount, upCount, downCount };
+  }, [sectors, stocks]);
+
+  const manualRefresh = async () => {
+    setStatus('connecting');
+    try {
+      await fetch('/api/refresh', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ maxRealtimeCodes: 80 }),
+      });
+    } catch (error) {
+      setStatus('stream-error');
+    } finally {
+      setStreamRevision((value) => value + 1);
+    }
+  };
 
   return (
-    <main className="app-shell dashboard-shell">
-      <header className="hero compact-hero">
-        <div>
-          <p className="eyebrow">Millionaire · Kiwoom Dashboard · {UI_REVISION}</p>
-          <h1>실시간 거래대금·섹터 플로우 보드</h1>
-          <p className="hero-copy">
-            숫자 데이터는 키움 실시간 FID를 우선 사용합니다. 미분류 섹터는 보조 분류를 허용하고, 1분/3분 10억 이상 거래대금 유입은 알림으로 강조합니다.
+    <main className="moneyboard-shell">
+      <header className="top-header">
+        <div className="brand">
+          <div className="brand-row">
+            <span className="logo">MoneyBoard</span>
+            <span className={`live-dot ${status}`}><span className="dot" />{statusLabel(status)}</span>
+          </div>
+          <p className="subtitle">
+            섹터별 거래대금 현황 · 키움 OpenAPI+ 로컬 브릿지 · {UI_REVISION} · <b>{snapshot.updatedAt ? new Date(snapshot.updatedAt).toLocaleTimeString('ko-KR', { hour12: false }) : '수신 대기'}</b>
           </p>
         </div>
-        <div className={`status-card ${status}`}>
-          <span className="status-dot" />
-          <strong>{statusLabel(status)}</strong>
-          <small>{snapshot.message || snapshot.error || snapshot.provider}</small>
+
+        <div className="stat-strip">
+          <Metric label="전체 거래대금" value={fmtTradeAmount(stats.totalTradeAmount)} />
+          <Metric label="상위 표시 거래대금" value={`${fmtTradeAmount(stats.topTradeAmount)} (${ratio(stats.topTradeAmount, stats.totalTradeAmount)})`} />
+          <Metric label="상승 종목 수" value={`${fmt(stats.upCount)}개`} tone="up" />
+          <Metric label="하락 종목 수" value={`${fmt(stats.downCount)}개`} tone="down" />
+          <button className="refresh-btn" onClick={manualRefresh} type="button">새로고침</button>
         </div>
       </header>
 
-      <MarketOverview overview={snapshot.overview} />
+      <MarketOverview snapshot={snapshot} />
 
-      <section className="toolbar">
-        <div className="metric-grid">
-          <Metric label="실시간 등록" value={`${fmt(snapshot.stats?.registeredCount)}종목`} />
-          <Metric label="FID 수신" value={`${fmt(snapshot.stats?.realtimeReadyCount)}종목`} />
-          <Metric label="표시 종목" value={`${fmt(snapshot.stats?.visibleStockCount)}종목`} />
-          <Metric label="1/3분 알림" value={`${fmt(snapshot.stats?.flowEventCount)}건`} />
-        </div>
-        <div className="sort-tabs">
-          {SORT_OPTIONS.map((option) => (
-            <button key={option.value} className={sort === option.value ? 'active' : ''} onClick={() => setSort(option.value)}>
-              {option.label}
-            </button>
-          ))}
-        </div>
-      </section>
+      <div className="layout">
+        <div className="main-col">
+          {(!snapshot.ok || snapshot.message) && (
+            <section className="notice">
+              <strong>{snapshot.ok ? '데이터 수신 상태' : '키움 브릿지 연결 필요'}</strong>
+              <p>{snapshot.message || snapshot.error || '`start-bridge.bat` 실행 후 키움 로그인을 완료하세요.'}</p>
+            </section>
+          )}
 
-      <section className="runtime-strip">
-        <span>감시 {fmt(snapshot.stats?.maxRealtimeCodes)}종목</span>
-        <span>현재가TR 배치 {fmt(snapshot.stats?.currentQuoteBatchLimit)}종목</span>
-        <span>섹터 {fmt(snapshot.stats?.sectorCount)}개</span>
-        <span>최종 갱신 {snapshot.updatedAt ? new Date(snapshot.updatedAt).toLocaleTimeString() : '-'}</span>
-      </section>
+          <section className="sector-grid" aria-label="섹터별 거래대금 보드">
+            {sectors.length ? sectors.map((sector, index) => (
+              <SectorCard
+                key={sector.name}
+                sector={sector}
+                rank={index + 1}
+                selected={sectorFilter === sector.name}
+                onSelect={() => setSectorFilter(sector.name)}
+              />
+            )) : <EmptyCard text="키움 실시간/현재가 TR 수신 대기 중입니다." />}
+          </section>
 
-      <FlowAlertPanel alerts={flowAlerts} />
-
-      {(!snapshot.ok || snapshot.message) && (
-        <section className="notice">
-          <strong>{snapshot.ok ? '데이터 수신 상태' : '키움 브릿지 연결 필요'}</strong>
-          <p>{snapshot.message || snapshot.error || '`start-bridge.bat`을 먼저 실행하고 키움 로그인을 완료하세요.'}</p>
-        </section>
-      )}
-
-      <section className="sector-board-panel">
-        <div className="detail-title compact">
-          <div>
-            <p className="eyebrow">Realtime Sector Amount Board</p>
-            <h2>섹터별 실시간 거래대금 보드</h2>
-          </div>
-          <span>{fmt(sectorBoard.length)}개 섹터</span>
-        </div>
-        <div className="sector-board-grid">
-          {sectorBoard.map((sector, index) => (
-            <button
-              key={sector.name}
-              className={`sector-board-card ${selectedSector === sector.name ? 'selected' : ''} ${sector.hotFlowCount ? 'alerting' : ''}`}
-              onClick={() => setSelectedSector(sector.name)}
-            >
-              <div className="board-rank">#{index + 1}</div>
-              <div className="board-main">
-                <strong>{sector.name}</strong>
-                <em>{fmtTradeAmount(sector.tradeAmountMillion)}</em>
-                <small>{fmt(sector.volume)}주 · 1분 {fmtTradeAmount(sector.flow60sTradeAmountMillion)} · 3분 {fmtTradeAmount(sector.flow180sTradeAmountMillion)}</small>
-              </div>
-              <BuySellBar buy={sector.buyRatio} sell={sector.sellRatio} net={sector.netBuyRatio} />
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section className="sector-grid">
-        {(snapshot.sectors || []).map((sector, index) => (
-          <button key={sector.name} className={`sector-card ${selectedSector === sector.name ? 'selected' : ''}`} onClick={() => setSelectedSector(sector.name)}>
-            <div className="sector-head">
-              <span className="rank">#{index + 1}</span>
-              <div>
-                <h2>{sector.name}</h2>
-                <p>{fmtTradeAmount(sector.tradeAmountMillion)} · {fmt(sector.volume)}주</p>
-              </div>
+          <section className="legend-row">
+            <div>
+              <span>※ 섹터 점수 = 거래대금 비중 + 상승/하락 강도 + 순매수/체결강도 보정</span>
             </div>
-            <div className="stock-mini-list">
-              {(sector.stocks || []).slice(0, 5).map((stock, stockIndex) => (
-                <div key={stock.code} className={`mini-row ${stock.flowHot ? 'hot-flow' : ''}`}>
-                  <span>{stockIndex + 1}</span>
-                  <strong>{stock.name}</strong>
-                  <em>{stock.flowHot ? '10억↑' : sort === 'volume' ? `${fmt(stock.volume)}주` : fmtTradeAmount(stock.tradeAmountMillion)}</em>
-                </div>
-              ))}
+            <div>
+              <span><b>★★</b> 1위</span>
+              <span><b>★☆</b> 2~3위</span>
+              <span>☆☆ 그 외</span>
             </div>
-          </button>
-        ))}
-      </section>
+          </section>
 
-      <section className="detail-panel">
-        <div className="detail-title">
-          <div>
-            <p className="eyebrow">Selected Sector</p>
-            <h2>{selected?.name || '섹터 없음'}</h2>
-          </div>
-          {selected && <span>{fmtTradeAmount(selected.tradeAmountMillion)} / {fmt(selected.volume)}주</span>}
-        </div>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>순위</th>
-                <th>종목</th>
-                <th>코드</th>
-                <th>현재가</th>
-                <th>등락률</th>
-                <th>일일 거래량</th>
-                <th>일일 거래대금</th>
-                <th>1분</th>
-                <th>3분</th>
-                <th>순매수비율</th>
-                <th>데이터 기준</th>
-                <th>수신</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(selected?.stocks || []).map((stock, index) => (
-                <tr key={stock.code} className={stock.flowHot ? 'hot-row' : ''}>
-                  <td>{index + 1}</td>
-                  <td className="stock-name">{stock.name}</td>
-                  <td>{stock.code}</td>
-                  <td>{fmtPrice(stock.price)}</td>
-                  <td className={Number(stock.changeRate) >= 0 ? 'up' : 'down'}>{fmtRate(stock.changeRate)}</td>
-                  <td>{fmt(stock.volume)}</td>
-                  <td title={tradeAmountTitle(stock)}>{fmtTradeAmount(stock.tradeAmountMillion)}</td>
-                  <td>{fmtTradeAmount(stock.flow60sTradeAmountMillion)}</td>
-                  <td>{fmtTradeAmount(stock.flow180sTradeAmountMillion)}</td>
-                  <td><span className={Number(stock.netBuyRatio) >= 0 ? 'ratio-up' : 'ratio-down'}>{fmtSignedRatio(stock.netBuyRatio)}</span></td>
-                  <td><span className={`source-badge ${stock.isRealtime ? 'realtime' : 'provisional'}`}>{stock.sourceLabel || (stock.isRealtime ? '실시간 FID' : '키움현재가TR')}</span></td>
-                  <td>{stock.updatedAt ? new Date(stock.updatedAt).toLocaleTimeString() : '-'}</td>
+          <section className="table-toolbar">
+            <div>
+              <p className="eyebrow">Realtime Stock Ranking</p>
+              <h2>상위 종목 리스트</h2>
+            </div>
+            <div className="table-controls">
+              <label className="chip"><input type="checkbox" checked={top20Only} onChange={(event) => setTop20Only(event.target.checked)} /> 상위 20개</label>
+              <select value={sectorFilter} onChange={(event) => setSectorFilter(event.target.value)}>
+                <option value="all">전체 섹터</option>
+                {sectors.map((sector) => <option key={sector.name} value={sector.name}>{sector.name}</option>)}
+              </select>
+              <select value={sort} onChange={(event) => setSort(event.target.value)}>
+                {SORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+            </div>
+          </section>
+
+          <section className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>순위</th>
+                  <th>종목코드</th>
+                  <th>종목명</th>
+                  <th>섹터</th>
+                  <th>현재가</th>
+                  <th>등락률</th>
+                  <th>거래량</th>
+                  <th>거래대금</th>
+                  <th>1분</th>
+                  <th>3분</th>
+                  <th>순매수</th>
+                  <th>점수</th>
+                  <th>수신</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {tableRows.length ? tableRows.map((stock, index) => (
+                  <StockRow key={`${stock.code}-${stock.sector}`} stock={stock} index={index} />
+                )) : (
+                  <tr><td colSpan="13" className="empty-cell">표시 가능한 종목이 없습니다.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </section>
+
+          <p className="footnote">숫자 데이터는 키움 OpenAPI+ 실시간 FID를 우선 사용하고, 실시간 공백 구간은 키움 현재가 TR 값으로만 보완합니다.</p>
         </div>
-      </section>
+
+        <aside className="side-col">
+          <BurstPanel alerts={snapshot.flowAlerts || []} threshold={snapshot.stats?.flowAlertThresholdMillion} />
+          <RuntimePanel snapshot={snapshot} stocks={stocks} sectors={sectors} />
+        </aside>
+      </div>
     </main>
   );
 }
 
-function MarketOverview({ overview }) {
-  const items = overview?.items || [];
+function MarketOverview({ snapshot }) {
+  const items = snapshot.overview?.items || [];
+  const fallbackItems = [
+    { key: 'registered', label: '실시간 등록', value: snapshot.stats?.registeredCount, suffix: '종목', ok: snapshot.ok },
+    { key: 'fid', label: 'FID 수신', value: snapshot.stats?.realtimeQuoteCount, suffix: '종목', ok: snapshot.ok },
+    { key: 'visible', label: '표시 종목', value: snapshot.stats?.visibleStockCount, suffix: '종목', ok: snapshot.ok },
+    { key: 'alerts', label: '1/3분 포착', value: snapshot.stats?.flowEventCount, suffix: '건', ok: snapshot.ok },
+  ];
+  const displayItems = items.length ? items : fallbackItems;
+
   return (
     <section className="overview-strip">
-      {items.length ? items.map((item) => (
-        <div key={item.key} className={`overview-card ${Number(item.changeRate) >= 0 ? 'up-card' : 'down-card'}`}>
+      {displayItems.map((item) => (
+        <div key={item.key} className={`overview-card ${item.ok === false ? 'waiting' : ''}`}>
           <div className="overview-head">
             <strong>{item.label}</strong>
             <span>{fmtOverviewValue(item)}</span>
           </div>
           <Sparkline points={item.points || []} />
-          <small>{fmtSigned(item.change)} · {fmtSignedRatio(item.changeRate)} · {item.ok ? item.source : '대기'}</small>
+          <small>{item.source || snapshot.provider || 'Kiwoom OpenAPI+'}</small>
         </div>
-      )) : (
-        <div className="overview-card loading">상단 지수/환율 수신 대기</div>
-      )}
+      ))}
     </section>
   );
 }
 
-function FlowAlertPanel({ alerts }) {
-  if (!alerts.length) return null;
+function SectorCard({ sector, rank, selected, onSelect }) {
+  const stocks = (sector.stocks || []).slice(0, 5);
+  const starCount = rank === 1 ? 2 : rank <= 3 ? 1 : 0;
   return (
-    <section className="flow-panel alert-panel">
-      <div className="detail-title compact">
-        <div>
-          <p className="eyebrow">Amount Flow Alert</p>
-          <h2>1분/3분 거래대금 10억 이상</h2>
-        </div>
-        <span>{fmt(alerts.length)}건</span>
+    <button className={`sector-card ${selected ? 'selected' : ''} ${sector.hotFlowCount ? 'alerting' : ''}`} onClick={onSelect} type="button">
+      <div className="sc-top">
+        <div className="sc-name"><span className="sc-rank">{rank}</span>{sector.name}</div>
+        <div className="sc-stars">{starText(starCount)}</div>
       </div>
-      <div className="flow-list alert-list">
-        {alerts.slice(0, 16).map((alert) => (
-          <div key={alert.key} className="flow-card pulse-alert">
-            <strong>{alert.name}</strong>
-            <span>{alert.sector} · {alert.windowLabel}</span>
-            <em>{fmtTradeAmount(alert.tradeAmountMillion)}</em>
-            <small>{fmt(alert.volume)}주 · {fmtPrice(alert.price)} · {alert.detectedAt ? new Date(alert.detectedAt).toLocaleTimeString() : '-'}</small>
+      <div className="sc-amount-row">
+        <span className="sc-amount">{fmtTradeAmount(sector.tradeAmountMillion)}</span>
+        <span className={`sc-change ${tone(sector.changeRate)}`}>{fmtRate(sector.changeRate)}</span>
+      </div>
+      <div className="sc-meta">
+        <span>종목 수 <b>{fmt(stocks.length)}개</b></span>
+        <span>순매수 <b className={tone(sector.netBuyRatio)}>{fmtSignedRatio(sector.netBuyRatio)}</b></span>
+      </div>
+      <div className="sc-meta muted">
+        <span>1분 {fmtTradeAmount(sector.flow60sTradeAmountMillion)}</span>
+        <span>3분 {fmtTradeAmount(sector.flow180sTradeAmountMillion)}</span>
+      </div>
+      <div className="sc-top5-label">TOP5</div>
+      <div className="stock-mini-list">
+        {stocks.length ? stocks.map((stock, index) => (
+          <div key={stock.code} className={`sc-stock-row ${index === 0 ? 'top1' : ''} ${stock.flowHot ? 'hot-flow' : ''}`}>
+            <span className="idx">{index + 1}</span>
+            <span className="name">{stock.name}</span>
+            <span className="amt">{fmtTradeAmount(stock.tradeAmountMillion)}</span>
+            <span className={`chg ${tone(stock.changeRate)}`}>{fmtRate(stock.changeRate)}</span>
           </div>
-        ))}
+        )) : <div className="mini-empty">수신 대기</div>}
       </div>
+    </button>
+  );
+}
+
+function StockRow({ stock, index }) {
+  const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : index + 1;
+  return (
+    <tr className={stock.flowHot ? 'hot-row' : ''}>
+      <td className={index < 3 ? 'rank-cell medal' : 'rank-cell'}>{medal}</td>
+      <td className="code-cell">{stock.code}</td>
+      <td className="name-cell">{stock.name}</td>
+      <td><span className="sector-tag">{stock.sector}</span></td>
+      <td className="num strong">{fmtPrice(stock.price)}</td>
+      <td className={`num strong ${tone(stock.changeRate)}`}>{fmtRate(stock.changeRate)}</td>
+      <td className="num">{fmt(stock.volume)}</td>
+      <td className="num">{fmtTradeAmount(stock.tradeAmountMillion)}</td>
+      <td className="num flow-cell">{fmtTradeAmount(stock.flow60sTradeAmountMillion)}</td>
+      <td className="num flow-cell">{fmtTradeAmount(stock.flow180sTradeAmountMillion)}</td>
+      <td className={`num strong ${tone(stock.netBuyRatio)}`}>{fmtSignedRatio(stock.netBuyRatio)}</td>
+      <td className="num"><span className="score-badge">{fmt(stock.sectorScore)}점</span></td>
+      <td><span className={`source-badge ${stock.isRealtime ? 'realtime' : 'provisional'}`}>{stock.sourceLabel || '-'}</span></td>
+    </tr>
+  );
+}
+
+function BurstPanel({ alerts, threshold }) {
+  const rows = [...alerts].sort((a, b) => new Date(b.detectedAt || 0) - new Date(a.detectedAt || 0)).slice(0, 60);
+  return (
+    <section className="burst-panel">
+      <div className="burst-head">
+        <div className="burst-title">거래대금 포착</div>
+        <span className="burst-count-badge">{fmt(rows.length)}건</span>
+      </div>
+      <p className="burst-sub">1분 또는 3분 거래대금 <b>{fmtTradeAmount(threshold || 1000)}</b> 이상 발생 시 포착</p>
+      <div className="burst-list">
+        {rows.length ? rows.map((alert) => (
+          <div className="burst-row fresh" key={alert.key || `${alert.code}-${alert.windowLabel}-${alert.detectedAt}`}>
+            <div className="burst-name-wrap">
+              <span className="burst-name">{alert.name}</span>
+              <span className="burst-meta-line"><span className={`tf-mini ${alert.windowSec === 60 ? 'tf1' : 'tf3'}`}>{alert.windowLabel}</span>{alert.sector} · {alert.code}</span>
+            </div>
+            <span className="burst-amt">{fmtTradeAmount(alert.tradeAmountMillion)}</span>
+            <span className="burst-count">{fmt(alert.count || 1)}회</span>
+          </div>
+        )) : <div className="burst-empty">아직 포착된 종목이 없습니다.</div>}
+      </div>
+      <div className="burst-foot"><span>{rows[0]?.detectedAt ? `마지막 ${new Date(rows[0].detectedAt).toLocaleTimeString('ko-KR', { hour12: false })}` : '대기 중'}</span></div>
     </section>
   );
 }
 
-function BuySellBar({ buy = 0, sell = 0, net = 0 }) {
-  const buyWidth = Math.max(0, Math.min(100, Number(buy) || 0));
+function RuntimePanel({ snapshot, stocks, sectors }) {
   return (
-    <div className="buy-sell-box">
-      <div className="buy-sell-label"><span>매수 {fmtRatio(buy)}</span><span>매도 {fmtRatio(sell)}</span></div>
-      <div className="buy-sell-track"><span style={{ width: `${buyWidth}%` }} /></div>
-      <small className={Number(net) >= 0 ? 'ratio-up' : 'ratio-down'}>순매수 {fmtSignedRatio(net)}</small>
+    <section className="runtime-panel">
+      <h3>실시간 수신 상태</h3>
+      <dl>
+        <div><dt>브릿지</dt><dd>{snapshot.ok ? '연결됨' : '대기'}</dd></div>
+        <div><dt>감시 후보</dt><dd>{fmt(snapshot.stats?.candidateCount)}종목</dd></div>
+        <div><dt>실시간 등록</dt><dd>{fmt(snapshot.stats?.registeredCount)}종목</dd></div>
+        <div><dt>FID 수신</dt><dd>{fmt(snapshot.stats?.realtimeQuoteCount)}종목</dd></div>
+        <div><dt>표시 섹터</dt><dd>{fmt(sectors.length)}개</dd></div>
+        <div><dt>표시 종목</dt><dd>{fmt(stocks.length)}종목</dd></div>
+      </dl>
+    </section>
+  );
+}
+
+function Metric({ label, value, tone: metricTone }) {
+  return (
+    <div className="stat-card">
+      <div className="stat-label">{label}</div>
+      <div className={`stat-value ${metricTone || ''}`}>{value}</div>
     </div>
   );
+}
+
+function EmptyCard({ text }) {
+  return <div className="sector-card empty-card">{text}</div>;
 }
 
 function Sparkline({ points }) {
@@ -273,15 +385,19 @@ function Sparkline({ points }) {
   return <svg className="sparkline" viewBox="0 0 100 38" preserveAspectRatio="none"><path d={d} /></svg>;
 }
 
-function Metric({ label, value }) {
-  return <div className="metric-card"><small>{label}</small><strong>{value}</strong></div>;
+function calcSectorScore(sector) {
+  const amount = Number(sector.tradeAmountMillion) || 0;
+  const rate = Math.max(0, Number(sector.changeRate) || 0);
+  const net = Math.max(0, Number(sector.netBuyRatio) || 0);
+  return Math.round(Math.min(100, amount / 1000 + rate * 8 + net * 0.6));
 }
 
 function statusLabel(status) {
   switch (status) {
-    case 'online': return '키움 브릿지 연결됨';
-    case 'bridge-error': return '브릿지 응답 오류';
-    case 'stream-error': return '스트림 재연결 대기';
+    case 'online': return '실시간';
+    case 'bridge-error': return '브릿지 오류';
+    case 'stream-error': return '재연결 대기';
+    case 'parse-error': return '데이터 오류';
     default: return '연결 중';
   }
 }
@@ -294,39 +410,20 @@ function fmt(value) {
 
 function fmtPrice(value) {
   const number = Number(value || 0);
-  if (!Number.isFinite(number) || number === 0) return '-';
+  if (!Number.isFinite(number) || number <= 0) return '-';
   return `${number.toLocaleString('ko-KR')}원`;
 }
 
 function fmtRate(value) {
   const number = Number(value || 0);
-  if (!Number.isFinite(number)) return '-';
+  if (!Number.isFinite(number) || number === 0) return '0.00%';
   return `${number > 0 ? '+' : ''}${number.toFixed(2)}%`;
-}
-
-function fmtRatio(value) {
-  const number = Number(value || 0);
-  if (!Number.isFinite(number)) return '-';
-  return `${number.toFixed(1)}%`;
 }
 
 function fmtSignedRatio(value) {
   const number = Number(value || 0);
-  if (!Number.isFinite(number)) return '-';
+  if (!Number.isFinite(number) || number === 0) return '0.0%';
   return `${number > 0 ? '+' : ''}${number.toFixed(1)}%`;
-}
-
-function fmtSigned(value) {
-  const number = Number(value || 0);
-  if (!Number.isFinite(number)) return '-';
-  return `${number > 0 ? '+' : ''}${number.toLocaleString('ko-KR', { maximumFractionDigits: 2 })}`;
-}
-
-function fmtOverviewValue(item) {
-  const value = Number(item?.value || 0);
-  if (!Number.isFinite(value) || value === 0) return '-';
-  if (item?.key === 'USD_KRW') return `${value.toLocaleString('ko-KR', { maximumFractionDigits: 2 })}원`;
-  return value.toLocaleString('ko-KR', { maximumFractionDigits: 2 });
 }
 
 function fmtTradeAmount(value) {
@@ -338,11 +435,25 @@ function fmtTradeAmount(value) {
   return `${million.toLocaleString('ko-KR', { maximumFractionDigits: 0 })}백만`;
 }
 
-function tradeAmountTitle(stock) {
-  const parts = [];
-  if (stock?.tradeAmountSource) parts.push(`source=${stock.tradeAmountSource}`);
-  if (stock?.tradeAmountUnitFix) parts.push(`unit=${stock.tradeAmountUnitFix}`);
-  if (stock?.tradeAmountRawMillion != null) parts.push(`rawMillion=${stock.tradeAmountRawMillion}`);
-  if (stock?.tradeAmountEstimatedMillion != null) parts.push(`estimatedMillion=${stock.tradeAmountEstimatedMillion}`);
-  return parts.join(' / ');
+function fmtOverviewValue(item) {
+  const value = Number(item?.value || 0);
+  if (!Number.isFinite(value)) return '-';
+  const suffix = item?.suffix || '';
+  if (item?.key === 'USD_KRW') return `${value.toLocaleString('ko-KR', { maximumFractionDigits: 2 })}원`;
+  return `${value.toLocaleString('ko-KR', { maximumFractionDigits: 2 })}${suffix}`;
+}
+
+function ratio(part, total) {
+  const p = Number(part || 0);
+  const t = Number(total || 0);
+  if (!p || !t) return '0.0%';
+  return `${((p / t) * 100).toFixed(1)}%`;
+}
+
+function tone(value) {
+  return Number(value || 0) >= 0 ? 'up' : 'down';
+}
+
+function starText(count) {
+  return `${'★'.repeat(count)}${'☆'.repeat(Math.max(0, 2 - count))}`;
 }
