@@ -1,5 +1,6 @@
 import cors from 'cors';
 import express from 'express';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,7 @@ loadDotEnv();
 
 const PORT = Number(process.env.PORT || 5188);
 const BRIDGE_URL = process.env.KIWOOM_BRIDGE_URL || 'http://127.0.0.1:8765';
+const AUTO_START_BRIDGE = !['0', 'false', 'no', 'off'].includes(String(process.env.KIWOOM_AUTO_START_BRIDGE || '1').toLowerCase());
 const POLL_MS = clampNumber(process.env.POLL_MS, 500, 10000, 1000);
 const DEFAULT_SECTOR_LIMIT = clampNumber(process.env.SECTOR_LIMIT, 1, 50, 12);
 const DEFAULT_STOCKS_PER_SECTOR = clampNumber(process.env.STOCKS_PER_SECTOR, 1, 50, 5);
@@ -214,6 +216,9 @@ app.listen(PORT, () => {
   console.log(`[millionaire] server listening on http://127.0.0.1:${PORT}/`);
   console.log(`[millionaire] local alias http://localhost:${PORT}/`);
   console.log(`[millionaire] bridge ${BRIDGE_URL}`);
+  ensureBridgeStarted().catch((error) => {
+    console.warn(`[millionaire] bridge auto-start skipped: ${error?.message || error}`);
+  });
 });
 
 async function fetchSnapshot(query = {}) {
@@ -317,6 +322,56 @@ async function bridgeJson(pathname, options = {}, timeoutMs = 5000) {
     return { ok: false, error: String(error?.message || error), bridgeUrl: BRIDGE_URL };
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function ensureBridgeStarted() {
+  if (!AUTO_START_BRIDGE) return;
+  if (!isLocalBridgeUrl(BRIDGE_URL)) return;
+
+  const health = await bridgeJson('/health', {}, 1500);
+  if (health.httpStatus || health.login || health.provider) {
+    console.log('[millionaire] Kiwoom bridge already reachable');
+    return;
+  }
+
+  const scriptPath = path.join(__dirname, 'bridge', 'kiwoom_bridge_flow.py');
+  if (!fs.existsSync(scriptPath)) {
+    console.warn(`[millionaire] Kiwoom bridge script not found: ${scriptPath}`);
+    return;
+  }
+
+  const python = process.env.KIWOOM_PYTHON || 'python';
+  const bridgeEnv = {
+    ...process.env,
+    MAX_REALTIME_CODES: process.env.MAX_REALTIME_CODES || '220',
+    CANDIDATE_REFRESH_MS: process.env.CANDIDATE_REFRESH_MS || '90000',
+    CURRENT_QUOTE_POLL_MS: process.env.CURRENT_QUOTE_POLL_MS || '45000',
+    CURRENT_QUOTE_BATCH_LIMIT: process.env.CURRENT_QUOTE_BATCH_LIMIT || '25',
+    TR_DELAY_MS: process.env.TR_DELAY_MS || '900',
+    KIWOOM_EXCHANGE_TYPE: process.env.KIWOOM_EXCHANGE_TYPE || '3',
+    FLOW_WINDOWS_SEC: process.env.FLOW_WINDOWS_SEC || '60,180',
+    FLOW_AMOUNT_THRESHOLD_MILLION: process.env.FLOW_AMOUNT_THRESHOLD_MILLION || '1000',
+    FLOW_EVENT_TTL_SEC: process.env.FLOW_EVENT_TTL_SEC || '900',
+  };
+
+  const child = spawn(python, ['kiwoom_bridge_flow.py'], {
+    cwd: path.join(__dirname, 'bridge'),
+    detached: true,
+    env: bridgeEnv,
+    stdio: 'ignore',
+    windowsHide: false,
+  });
+  child.unref();
+  console.log(`[millionaire] Kiwoom bridge auto-start requested with ${python}`);
+}
+
+function isLocalBridgeUrl(value) {
+  try {
+    const url = new URL(value);
+    return ['127.0.0.1', 'localhost', '::1'].includes(url.hostname);
+  } catch {
+    return false;
   }
 }
 
