@@ -454,6 +454,112 @@ class KiwoomController(QObject):
             },
         }
 
+    def _request_daily_trade_detail(self, code: str, start_date: str) -> List[Dict[str, Any]]:
+        normalized_code = clean_code(code)
+        fields = [
+            '일자', '종가', '현재가', '전일대비기호', '전일대비', '등락률', '등락율',
+            '거래량', '거래대금', '장전거래량', '장전거래비중', '장중거래량',
+            '장중거래비중', '장후거래량', '장후거래비중', '합계3', '기간중거래량',
+            '체결강도', '외인보유', '외인비중', '외인순매수', '기관순매수',
+            '개인순매수', '외국계', '신용잔고율', '프로그램', '장전거래대금',
+            '장전거래대금비중', '장중거래대금', '장중거래대금비중', '장후거래대금',
+            '장후거래대금비중',
+        ]
+        return self._request_tr(
+            f'daily_trade_detail_{normalized_code}',
+            'opt10015',
+            {'종목코드': normalized_code, '시작일자': start_date},
+            fields,
+        )
+
+    def daily_detail_amount_rank(self, limit: int = 50, max_codes: int = 120, start_date: str = '') -> Dict[str, Any]:
+        if not self.login:
+            return {'ok': False, 'error': 'Kiwoom login required'}
+
+        date_text = re.sub(r'[^0-9]', '', str(start_date or ''))[:8] or datetime.now().strftime('%Y%m%d')
+        desired_scan_limit = max(1, min(int(max_codes or 120), 220))
+        codes = list(self.registered_codes or self.candidates.keys())
+        if len(codes) < desired_scan_limit:
+            self.refresh_candidates(max(desired_scan_limit, MAX_REALTIME_CODES))
+            codes = list(self.registered_codes or self.candidates.keys())
+
+        scan_limit = max(1, min(desired_scan_limit, len(codes), 220))
+        self._hydrate_master(codes[:scan_limit])
+
+        items: List[Dict[str, Any]] = []
+        for code in codes[:scan_limit]:
+            master = self.master.get(code, {})
+            name = master.get('name') or self._code_name(code)
+            if bool(master.get('excluded')) or is_excluded_name(name):
+                continue
+
+            rows = self._request_daily_trade_detail(code, date_text)
+            if not rows:
+                pause(TR_DELAY_MS)
+                continue
+
+            row = rows[0]
+            price = to_int(row.get('종가') or row.get('현재가'))
+            volume = to_int(row.get('거래량'))
+            trade_amount_million, amount_meta = normalize_trade_amount_million(
+                row.get('거래대금'),
+                price=price,
+                volume=volume,
+                source='daily-detail-tr-opt10015',
+            )
+            regular_amount_million, _ = normalize_trade_amount_million(
+                row.get('장중거래대금'),
+                price=price,
+                volume=to_int(row.get('장중거래량')) or volume,
+                source='daily-detail-regular-tr-opt10015',
+            )
+
+            if trade_amount_million <= 0 and regular_amount_million > 0:
+                trade_amount_million = regular_amount_million
+
+            items.append({
+                'code': code,
+                'name': name,
+                'sector': master.get('sector') or '미분류',
+                'price': price,
+                'changeRate': to_number(row.get('등락률') or row.get('등락율')),
+                'volume': volume,
+                'tradeAmountMillion': trade_amount_million,
+                'regularTradeAmountMillion': regular_amount_million,
+                'preMarketTradeAmountRaw': row.get('장전거래대금'),
+                'postMarketTradeAmountRaw': row.get('장후거래대금'),
+                'date': str(row.get('일자') or date_text).strip(),
+                'source': 'kiwoom-daily-detail-tr-opt10015',
+                'sourceLabel': '키움일별거래상세TR',
+                'updatedAt': now_iso(),
+                'rawDailyDetail': row,
+                **amount_meta,
+            })
+            pause(TR_DELAY_MS)
+
+        items.sort(key=lambda item: (int(item.get('tradeAmountMillion') or 0), int(item.get('volume') or 0)), reverse=True)
+        limited = items[:max(1, min(int(limit or 50), 100))]
+        for index, item in enumerate(limited, start=1):
+            item['rank'] = index
+
+        return {
+            'ok': True,
+            'provider': 'Kiwoom OpenAPI+ opt10015',
+            'updatedAt': now_iso(),
+            'criteria': {
+                'rank': 'daily-detail-trade-amount',
+                'date': date_text,
+                'limit': limit,
+                'scannedCodes': scan_limit,
+            },
+            'items': limited,
+            'stats': {
+                'count': len(limited),
+                'scannedCodes': scan_limit,
+                'totalTradeAmountMillion': sum(int(item.get('tradeAmountMillion') or 0) for item in limited),
+            },
+        }
+
     def _request_current_quote(self, code: str) -> Optional[Dict[str, Any]]:
         normalized_code = clean_code(code)
         candidate = self.candidates.get(normalized_code, {})
@@ -1042,6 +1148,15 @@ def ranking_debug(code: str) -> Dict[str, Any]:
 def daily_amount_rank(limit: int = 50, markets: str = '') -> Dict[str, Any]:
     market_list = [item.strip() for item in str(markets or '').split(',') if item.strip()] or None
     return run_controller_call(lambda: controller.daily_amount_rank(max(1, min(int(limit or 50), 100)), market_list), 90)
+
+
+@api.get('/daily-detail-rank')
+def daily_detail_rank(limit: int = 50, maxCodes: int = 120, date: str = '') -> Dict[str, Any]:
+    scan_limit = max(1, min(int(maxCodes or 120), 220))
+    return run_controller_call(
+        lambda: controller.daily_detail_amount_rank(max(1, min(int(limit or 50), 100)), scan_limit, str(date or '')),
+        max(120, scan_limit * 3),
+    )
 
 
 @api.get('/stock/{code}')

@@ -161,6 +161,24 @@ app.get('/api/daily-amount-rank', async (req, res) => {
   }));
 });
 
+app.get('/api/daily-detail-rank', async (req, res) => {
+  const limit = Math.max(1, Math.min(toInt(req.query.limit, 50), 100));
+  const maxCodes = Math.max(1, Math.min(toInt(req.query.maxCodes, 120), 220));
+  const date = String(req.query.date || '').replace(/\D/g, '').slice(0, 8);
+  const params = new URLSearchParams({ limit: String(limit), maxCodes: String(maxCodes) });
+  if (date) params.set('date', date);
+
+  const bridge = await bridgeJson(`/daily-detail-rank?${params.toString()}`, {}, Math.max(120000, maxCodes * 3000));
+  if (bridge.ok) return res.json(normalizeDailyDetailRankPayload(bridge));
+
+  res.status(503).json(normalizeDailyDetailRankPayload({
+    ok: false,
+    provider: 'Kiwoom OpenAPI+ opt10015',
+    items: [],
+    message: bridge.error || bridge.message || '키움 일별거래상세 TR 순위를 불러오지 못했습니다.',
+  }));
+});
+
 app.get('/api/stream', async (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -367,6 +385,31 @@ function normalizeDailyAmountRankPayload(payload) {
     provider: payload.provider || 'Kiwoom OpenAPI+ opt10032',
     updatedAt: payload.updatedAt || new Date().toISOString(),
     criteria: payload.criteria || { rank: 'daily-trade-amount' },
+    items,
+    stats: payload.stats || {
+      count: items.length,
+      totalTradeAmountMillion: items.reduce((sum, item) => sum + Number(item.tradeAmountMillion || 0), 0),
+    },
+    message: payload.message || payload.error || null,
+  };
+}
+
+function normalizeDailyDetailRankPayload(payload) {
+  const rows = Array.isArray(payload.items) ? payload.items : [];
+  const items = rows.map((row, index) => ({
+    ...row,
+    rank: Number(row.rank || index + 1),
+    sector: row.sector || '미분류',
+    tradeAmountMillion: Number(row.tradeAmountMillion || 0),
+    regularTradeAmountMillion: Number(row.regularTradeAmountMillion || 0),
+    volume: Number(row.volume || 0),
+    sourceLabel: row.sourceLabel || '키움일별거래상세TR',
+  }));
+  return {
+    ok: Boolean(payload.ok),
+    provider: payload.provider || 'Kiwoom OpenAPI+ opt10015',
+    updatedAt: payload.updatedAt || new Date().toISOString(),
+    criteria: payload.criteria || { rank: 'daily-detail-trade-amount' },
     items,
     stats: payload.stats || {
       count: items.length,

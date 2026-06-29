@@ -77,7 +77,7 @@ function DashboardPage() {
     if (boardMode !== 'daily') return;
     let cancelled = false;
     setDailyRankLoading(true);
-    fetchJson('/api/daily-amount-rank?limit=50')
+    fetchJson('/api/daily-detail-rank?limit=50&maxCodes=120')
       .then((next) => {
         if (!cancelled) setDailyRank(next);
       })
@@ -161,7 +161,7 @@ function DashboardPage() {
 
         <div className="stat-strip">
           <Metric label="전체 거래대금" value={fmtTradeAmount(stats.totalTradeAmount)} />
-          <Metric label={boardMode === 'daily' ? '일일 TOP20 거래대금' : '상위 표시 거래대금'} value={boardMode === 'daily' ? `${fmtTradeAmount(stats.top20TradeAmount)} (${ratio(stats.top20TradeAmount, stats.totalTradeAmount)})` : `${fmtTradeAmount(stats.topTradeAmount)} (${ratio(stats.topTradeAmount, stats.totalTradeAmount)})`} />
+          <Metric label={boardMode === 'daily' ? '일별 TOP20 거래대금' : '상위 표시 거래대금'} value={boardMode === 'daily' ? `${fmtTradeAmount(stats.top20TradeAmount)} (${ratio(stats.top20TradeAmount, stats.totalTradeAmount)})` : `${fmtTradeAmount(stats.topTradeAmount)} (${ratio(stats.topTradeAmount, stats.totalTradeAmount)})`} />
           <Metric label="상승 종목 수" value={`${fmt(stats.upCount)}개`} tone="up" />
           <Metric label="하락 종목 수" value={`${fmt(stats.downCount)}개`} tone="down" />
           <button className="tool-button" onClick={manualRefresh} type="button" title="새로고침" aria-label="새로고침">↻</button>
@@ -181,20 +181,20 @@ function DashboardPage() {
       <div className="dashboard-layout">
         <div className="main-col">
           <div className="section-heading">
-            <h2>{boardMode === 'daily' ? '일일 거래대금순' : '섹터별 거래대금'}</h2>
+            <h2>{boardMode === 'daily' ? '일별 거래대금순' : '섹터별 거래대금'}</h2>
             <div className="section-actions">
-              <span>{boardMode === 'daily' ? '키움 거래대금상위 TR 기준' : '거래대금 상위 섹터와 대표 종목'}</span>
+              <span>{boardMode === 'daily' ? '키움 일별거래상세 TR 기준' : '거래대금 상위 섹터와 대표 종목'}</span>
               <div className="segmented small">
                 <button className={boardMode === 'sector' ? 'active' : ''} type="button" onClick={() => changeBoardMode('sector')}>섹터 보기</button>
-                <button className={boardMode === 'daily' ? 'active' : ''} type="button" onClick={() => changeBoardMode('daily')}>일일 거래대금순</button>
+                <button className={boardMode === 'daily' ? 'active' : ''} type="button" onClick={() => changeBoardMode('daily')}>일별 거래대금순</button>
               </div>
             </div>
           </div>
           {boardMode === 'daily' ? (
-            <section className="daily-rank-grid" aria-label="일일 거래대금 순위">
+            <section className="daily-rank-grid" aria-label="일별 거래대금 순위">
               {dailyRankRows.length ? dailyRankRows.map((stock, index) => (
                 <DailyRankCard key={`${stock.code}-${stock.sector}`} stock={stock} rank={stock.rank || index + 1} />
-              )) : <EmptyPanel text={dailyRankLoading ? '키움 거래대금상위 TR을 조회하는 중입니다.' : '키움 거래대금상위 순위를 불러오지 못했습니다.'} />}
+              )) : <EmptyPanel text={dailyRankLoading ? '키움 일별거래상세 TR을 조회하는 중입니다.' : '키움 일별거래상세 순위를 불러오지 못했습니다.'} />}
             </section>
           ) : (
             <section className="sector-grid" aria-label="섹터별 거래대금 보드">
@@ -211,14 +211,14 @@ function DashboardPage() {
           )}
 
           <section className="legend-row">
-            <span>{boardMode === 'daily' ? `일일 거래대금순: ${providerText(dailyRank.provider || 'Kiwoom OpenAPI+ opt10032')} · ${dailyRank.updatedAt ? timeText(dailyRank.updatedAt) : '조회 대기'}` : '섹터 강도: 거래대금 · 등락률 · 순매수 기준'}</span>
+            <span>{boardMode === 'daily' ? `일별 거래대금순: ${providerText(dailyRank.provider || 'Kiwoom OpenAPI+ opt10015')} · ${dailyRank.updatedAt ? timeText(dailyRank.updatedAt) : '조회 대기'}` : '섹터 강도: 거래대금 · 등락률 · 순매수 기준'}</span>
             <span>급증: 1분/3분 거래대금 {fmtTradeAmount(snapshot.stats?.flowAlertThresholdMillion || 1000)} 이상</span>
           </section>
 
           <section className="table-toolbar">
             <div>
               <p className="eyebrow">Realtime Stock Ranking</p>
-              <h2>{boardMode === 'daily' ? '일일 거래대금 상세 리스트' : '상위 종목 리스트'}</h2>
+              <h2>{boardMode === 'daily' ? '일별 거래대금 상세 리스트' : '상위 종목 리스트'}</h2>
             </div>
             <div className="table-controls">
               <label className="chip"><input type="checkbox" checked={top20Only} onChange={(event) => setTop20Only(event.target.checked)} /> 상위 20개</label>
@@ -227,7 +227,7 @@ function DashboardPage() {
                 {sectors.map((sector) => <option key={sector.name} value={sector.name}>{sector.name}</option>)}
               </select>
               {boardMode === 'daily' ? (
-                <span className="chip fixed-chip">일일 거래대금 기준</span>
+                <span className="chip fixed-chip">일별거래상세 기준</span>
               ) : (
                 <select value={sort} onChange={(event) => setSort(event.target.value)}>
                   {DASHBOARD_SORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
@@ -881,6 +881,7 @@ function providerText(value) {
   const text = String(value || 'Kiwoom OpenAPI+');
   return text
     .replace('Kiwoom OpenAPI+ only', 'Kiwoom OpenAPI+')
+    .replace('Kiwoom OpenAPI+ opt10015', '키움 일별거래상세 TR')
     .replace('Kiwoom OpenAPI+ opt10032', '키움 거래대금상위 TR')
     .replace('Kiwoom OpenAPI+ snapshot fallback', 'Kiwoom 스냅샷')
     .replace('Kiwoom OpenAPI+ opt10081', '키움 일봉 TR')
