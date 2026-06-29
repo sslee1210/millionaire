@@ -35,6 +35,7 @@ TR_DELAY_MS = int(os.getenv('TR_DELAY_MS', '750'))
 SCREEN_BASE = int(os.getenv('KIWOOM_SCREEN_BASE', '9100'))
 SCREEN_CAPACITY = int(os.getenv('KIWOOM_SCREEN_CAPACITY', '80'))
 MARKETS = [item.strip() for item in os.getenv('KIWOOM_RANKING_MARKETS', '001,101').split(',') if item.strip()]
+AMOUNT_RANK_MARKETS = [item.strip() for item in os.getenv('KIWOOM_AMOUNT_RANK_MARKETS', '000').split(',') if item.strip()]
 STRICT_REALTIME_ONLY = os.getenv('KIWOOM_STRICT_REALTIME', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
 ALLOW_CURRENT_TR_FALLBACK = os.getenv('KIWOOM_ALLOW_CURRENT_TR_FALLBACK', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
 DISPLAY_RANKING_BASELINE = os.getenv('KIWOOM_DISPLAY_RANKING_BASELINE', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
@@ -401,14 +402,20 @@ class KiwoomController(QObject):
         fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '현재거래량', '거래대금']
         return self._request_tr('amount_rank', 'opt10032', inputs, fields)
 
-    def daily_amount_rank(self, limit: int = 50) -> Dict[str, Any]:
+    def daily_amount_rank(self, limit: int = 50, markets: Optional[List[str]] = None) -> Dict[str, Any]:
         if not self.login:
             return {'ok': False, 'error': 'Kiwoom login required'}
 
         ranking_rows: Dict[str, Dict[str, Any]] = {}
-        for market in MARKETS:
+        market_list = [item for item in (markets or AMOUNT_RANK_MARKETS) if item]
+        for market in market_list:
             self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank', market)
             pause(TR_DELAY_MS)
+        if not ranking_rows and market_list != MARKETS:
+            market_list = MARKETS
+            for market in market_list:
+                self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank', market)
+                pause(TR_DELAY_MS)
 
         rows = sorted(
             ranking_rows.values(),
@@ -438,7 +445,7 @@ class KiwoomController(QObject):
             'criteria': {
                 'rank': 'daily-trade-amount',
                 'limit': limit,
-                'markets': MARKETS,
+                'markets': market_list,
             },
             'items': items,
             'stats': {
@@ -1032,8 +1039,9 @@ def ranking_debug(code: str) -> Dict[str, Any]:
 
 
 @api.get('/daily-amount-rank')
-def daily_amount_rank(limit: int = 50) -> Dict[str, Any]:
-    return run_controller_call(lambda: controller.daily_amount_rank(max(1, min(int(limit or 50), 100))), 90)
+def daily_amount_rank(limit: int = 50, markets: str = '') -> Dict[str, Any]:
+    market_list = [item.strip() for item in str(markets or '').split(',') if item.strip()] or None
+    return run_controller_call(lambda: controller.daily_amount_rank(max(1, min(int(limit or 50), 100)), market_list), 90)
 
 
 @api.get('/stock/{code}')

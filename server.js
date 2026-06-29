@@ -136,7 +136,10 @@ app.get('/api/ranking-debug/:code', async (req, res) => {
 
 app.get('/api/daily-amount-rank', async (req, res) => {
   const limit = Math.max(1, Math.min(toInt(req.query.limit, 50), 100));
-  const bridge = await bridgeJson(`/daily-amount-rank?limit=${limit}`, {}, 120000);
+  const markets = String(req.query.markets || '').trim();
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (markets) params.set('markets', markets);
+  const bridge = await bridgeJson(`/daily-amount-rank?${params.toString()}`, {}, 120000);
   if (bridge.ok) return res.json(normalizeDailyAmountRankPayload(bridge));
 
   const snapshot = await fetchSnapshot({
