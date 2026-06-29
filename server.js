@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 
 loadDotEnv();
 
-const PORT = Number(process.env.PORT || 4173);
+const PORT = Number(process.env.PORT || 5188);
 const BRIDGE_URL = process.env.KIWOOM_BRIDGE_URL || 'http://127.0.0.1:8765';
 const POLL_MS = clampNumber(process.env.POLL_MS, 500, 10000, 1000);
 const DEFAULT_SECTOR_LIMIT = clampNumber(process.env.SECTOR_LIMIT, 1, 50, 12);
@@ -82,6 +82,58 @@ app.post('/api/refresh', async (req, res) => {
   res.status(result.ok ? 200 : 503).json(result);
 });
 
+app.get('/api/screener', async (req, res) => {
+  const params = new URLSearchParams();
+  params.set('lookbackDays', String(toInt(req.query.lookbackDays, 63)));
+  params.set('thresholdRate', String(toNumber(req.query.thresholdRate, 10)));
+  params.set('thresholdAmountEok', String(toNumber(req.query.thresholdAmountEok, 100)));
+  params.set('maxCodes', String(toInt(req.query.maxCodes, 20)));
+  params.set('sort', String(req.query.sort || 'recent'));
+  if (req.query.sector && req.query.sector !== 'all') params.set('sector', String(req.query.sector));
+
+  const bridge = await bridgeJson(`/screener?${params.toString()}`, {}, 120000);
+  if (bridge.ok) {
+    return res.json(normalizeScreenerPayload(bridge));
+  }
+
+  const snapshot = await fetchSnapshot({
+    sectorLimit: 50,
+    stocksPerSector: 20,
+    maxRealtimeCodes: DEFAULT_MAX_REALTIME_CODES,
+    sort: 'tradeAmount',
+  });
+  const fallback = buildSnapshotScreener(snapshot, bridge, {
+    sector: String(req.query.sector || 'all'),
+    sort: String(req.query.sort || 'recent'),
+    thresholdRate: toNumber(req.query.thresholdRate, 10),
+    thresholdAmountEok: toNumber(req.query.thresholdAmountEok, 100),
+  });
+  res.status(snapshot.ok ? 200 : 503).json(fallback);
+});
+
+app.get('/api/stock/:code', async (req, res) => {
+  const code = cleanCode(req.params.code);
+  const bridge = await bridgeJson(`/stock/${code}`, {}, 90000);
+  if (bridge.ok) {
+    return res.json(normalizeStockPayload(bridge, code));
+  }
+
+  const snapshot = await fetchSnapshot({
+    sectorLimit: 50,
+    stocksPerSector: 20,
+    maxRealtimeCodes: DEFAULT_MAX_REALTIME_CODES,
+    sort: 'tradeAmount',
+  });
+  const fallback = buildSnapshotStockDetail(snapshot, code, bridge);
+  res.status(fallback.ok ? 200 : 503).json(fallback);
+});
+
+app.get('/api/ranking-debug/:code', async (req, res) => {
+  const code = cleanCode(req.params.code);
+  const bridge = await bridgeJson(`/ranking-debug/${code}`, {}, 120000);
+  res.status(bridge.ok ? 200 : 503).json(bridge);
+});
+
 app.get('/api/stream', async (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -114,7 +166,8 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`[millionaire] server listening on http://localhost:${PORT}`);
+  console.log(`[millionaire] server listening on http://127.0.0.1:${PORT}/`);
+  console.log(`[millionaire] local alias http://localhost:${PORT}/`);
   console.log(`[millionaire] bridge ${BRIDGE_URL}`);
 });
 
@@ -151,8 +204,8 @@ function enrichFlow(snapshot, sortKey) {
 
 function enrichStockFlow(stock, sector, now, alerts) {
   const code = String(stock.code || '');
-  const amount = Number(stock.tradeAmountMillion || 0);
-  const volume = Number(stock.volume || 0);
+  const amount = Number(stock.realtimeTradeAmountMillion ?? stock.tradeAmountMillion ?? 0);
+  const volume = Number(stock.realtimeVolume ?? stock.volume ?? 0);
   const price = Number(stock.price || 0);
   const samples = samplesByCode.get(code) || [];
   samples.push({ ts: now, amount, volume });
@@ -207,9 +260,9 @@ function sectorScore(amount, rate, net) {
   return Math.round(Math.min(100, Math.max(0, amount / 1000 + Math.max(0, rate) * 8 + Math.max(0, net) * 0.6)));
 }
 
-async function bridgeJson(pathname, options = {}) {
+async function bridgeJson(pathname, options = {}, timeoutMs = 5000) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${BRIDGE_URL}${pathname}`, { ...options, signal: controller.signal });
     const text = await response.text();
@@ -227,10 +280,188 @@ function toInt(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function toNumber(value, fallback) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function clampNumber(value, min, max, fallback) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(max, Math.max(min, parsed));
+}
+
+function cleanCode(value) {
+  return String(value || '').replace(/\D/g, '').padStart(6, '0').slice(-6);
+}
+
+function flattenSnapshotStocks(snapshot) {
+  const rows = [];
+  const sectors = snapshot?.sectorFlowBoard?.length ? snapshot.sectorFlowBoard : snapshot?.sectors || [];
+  sectors.forEach((sector, sectorIndex) => {
+    (sector.stocks || []).forEach((stock) => {
+      rows.push({
+        ...stock,
+        sector: stock.sector || sector.name || '미분류',
+        sectorRank: sectorIndex + 1,
+        sectorScore: sector.score || 0,
+      });
+    });
+  });
+  return rows;
+}
+
+function normalizeScreenerPayload(payload) {
+  const rows = Array.isArray(payload.items) ? payload.items : [];
+  return {
+    ok: true,
+    provider: payload.provider || 'Kiwoom OpenAPI+',
+    updatedAt: payload.updatedAt || new Date().toISOString(),
+    criteria: payload.criteria || {},
+    sectors: payload.sectors || uniqueValues(rows.map((row) => row.sector)),
+    items: rows,
+    stats: payload.stats || screenerStats(rows),
+    message: payload.message || null,
+  };
+}
+
+function normalizeStockPayload(payload, code) {
+  return {
+    ok: true,
+    provider: payload.provider || 'Kiwoom OpenAPI+',
+    updatedAt: payload.updatedAt || new Date().toISOString(),
+    stock: payload.stock || payload.quote || { code },
+    candles: Array.isArray(payload.candles) ? payload.candles : [],
+    company: payload.company || {},
+    financials: payload.financials || { quarter: [], year: [] },
+    peers: payload.peers || [],
+    news: payload.news || [],
+    unavailable: payload.unavailable || [],
+  };
+}
+
+function buildSnapshotScreener(snapshot, bridgeError, options) {
+  let rows = flattenSnapshotStocks(snapshot)
+    .filter((stock) => options.sector === 'all' || stock.sector === options.sector)
+    .filter((stock) => Number(stock.changeRate || 0) >= 5 || Number(stock.flow60sTradeAmountMillion || 0) > 0)
+    .map((stock) => {
+      const amountEok = Number(stock.tradeAmountMillion || 0) / 100;
+      const rate = Number(stock.changeRate || 0);
+      const event = {
+        date: String(stock.updatedAt || snapshot.updatedAt || new Date().toISOString()).slice(0, 10),
+        rate,
+        amountEok,
+        open: 0,
+        close: Number(stock.price || 0),
+        source: stock.sourceLabel || '스냅샷',
+      };
+      return {
+        code: stock.code,
+        name: stock.name,
+        sector: stock.sector,
+        market: stock.market || '-',
+        price: stock.price,
+        changeRate: rate,
+        amountEok,
+        volume: stock.volume,
+        events: [event],
+        topEvent: event,
+        sourceLabel: '현재 스냅샷 대체',
+      };
+    });
+
+  rows = sortScreenerRows(rows, options.sort);
+  return {
+    ok: Boolean(snapshot.ok),
+    provider: 'Kiwoom OpenAPI+ snapshot fallback',
+    updatedAt: snapshot.updatedAt || new Date().toISOString(),
+    criteria: {
+      lookbackDays: 63,
+      thresholdRate: options.thresholdRate,
+      thresholdAmountEok: options.thresholdAmountEok,
+      fallback: true,
+    },
+    sectors: uniqueValues(rows.map((row) => row.sector)),
+    items: rows,
+    stats: screenerStats(rows),
+    message: snapshot.ok
+      ? '키움 브리지의 일봉 스크리너 엔드포인트가 없어 현재 스냅샷으로 대체 표시 중입니다.'
+      : bridgeError?.error || snapshot.error || snapshot.message || '키움 브릿지 연결이 필요합니다.',
+  };
+}
+
+function buildSnapshotStockDetail(snapshot, code, bridgeError) {
+  const rows = flattenSnapshotStocks(snapshot);
+  const stock = rows.find((row) => cleanCode(row.code) === code);
+  if (!stock) {
+    return {
+      ok: false,
+      provider: 'Kiwoom OpenAPI+ snapshot fallback',
+      stock: { code },
+      candles: [],
+      company: {},
+      financials: { quarter: [], year: [] },
+      peers: [],
+      news: [],
+      unavailable: ['일봉', '뉴스', '기업개요', '재무', '동종업계 비교'],
+      message: bridgeError?.error || snapshot.message || '현재 스냅샷에서 종목을 찾지 못했습니다.',
+    };
+  }
+
+  const peers = rows
+    .filter((row) => row.sector === stock.sector)
+    .sort((a, b) => Number(b.tradeAmountMillion || 0) - Number(a.tradeAmountMillion || 0))
+    .slice(0, 6)
+    .map((row) => ({ code: row.code, name: row.name, amountEok: Number(row.tradeAmountMillion || 0) / 100, me: cleanCode(row.code) === code }));
+
+  return {
+    ok: true,
+    provider: 'Kiwoom OpenAPI+ snapshot fallback',
+    updatedAt: snapshot.updatedAt || new Date().toISOString(),
+    stock,
+    candles: [],
+    company: {
+      sector: stock.sector,
+      market: stock.market || '-',
+      summary: '키움 현재가/실시간 스냅샷으로 표시 중입니다. 기업개요 데이터 공급자가 연결되면 이 영역이 채워집니다.',
+    },
+    financials: { quarter: [], year: [] },
+    peers,
+    news: [],
+    unavailable: ['일봉', '뉴스', '기업개요 일부', '재무'],
+    message: '키움 브리지 상세 엔드포인트가 없어 현재 스냅샷으로 대체 표시 중입니다.',
+  };
+}
+
+function sortScreenerRows(rows, sort) {
+  const sorted = [...rows];
+  if (sort === 'rate') sorted.sort((a, b) => Number(b.topEvent?.rate || 0) - Number(a.topEvent?.rate || 0));
+  else if (sort === 'amount') sorted.sort((a, b) => Number(b.topEvent?.amountEok || 0) - Number(a.topEvent?.amountEok || 0));
+  else if (sort === 'count') sorted.sort((a, b) => Number(b.events?.length || 0) - Number(a.events?.length || 0));
+  else sorted.sort((a, b) => new Date(b.topEvent?.date || 0) - new Date(a.topEvent?.date || 0));
+  return sorted;
+}
+
+function screenerStats(rows) {
+  const eventCount = rows.reduce((sum, row) => sum + Number(row.events?.length || 0), 0);
+  const rates = rows.flatMap((row) => (row.events || []).map((event) => Number(event.rate || 0))).filter(Number.isFinite);
+  const recentCount = rows.filter((row) => (row.events || []).some((event) => daysAgo(event.date) <= 7)).length;
+  return {
+    stockCount: rows.length,
+    eventCount,
+    avgRate: rates.length ? rates.reduce((sum, rate) => sum + rate, 0) / rates.length : 0,
+    recentCount,
+  };
+}
+
+function daysAgo(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 9999;
+  return Math.floor((Date.now() - date.getTime()) / 86400000);
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b), 'ko-KR'));
 }
 
 function loadDotEnv() {

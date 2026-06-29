@@ -16,5 +16,5 @@ set OVERVIEW_CACHE_MS=3000
 echo [millionaire] Starting dashboard on http://localhost:5188
 call npm run build
 if errorlevel 1 exit /b 1
-node server_plus.js
+node server.js
 pause
