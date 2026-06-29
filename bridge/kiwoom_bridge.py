@@ -401,6 +401,51 @@ class KiwoomController(QObject):
         fields = ['종목코드', '종목명', '현재가', '전일대비', '등락률', '등락율', '거래량', '현재거래량', '거래대금']
         return self._request_tr('amount_rank', 'opt10032', inputs, fields)
 
+    def daily_amount_rank(self, limit: int = 50) -> Dict[str, Any]:
+        if not self.login:
+            return {'ok': False, 'error': 'Kiwoom login required'}
+
+        ranking_rows: Dict[str, Dict[str, Any]] = {}
+        for market in MARKETS:
+            self._merge_rank_rows(ranking_rows, self._request_amount_rank(market), 'amountRank', market)
+            pause(TR_DELAY_MS)
+
+        rows = sorted(
+            ranking_rows.values(),
+            key=lambda item: (int(item.get('amountRank') or 9999), -int(item.get('tradeAmountMillion') or 0)),
+        )
+        rows = rows[:max(1, min(int(limit or 50), 100))]
+        self._hydrate_master([row['code'] for row in rows])
+
+        items = []
+        for index, row in enumerate(rows, start=1):
+            master = self.master.get(row['code'], {})
+            items.append({
+                **row,
+                'rank': index,
+                'sector': master.get('sector') or '미분류',
+                'sourceLabel': '키움거래대금순TR',
+                'updatedAt': now_iso(),
+            })
+
+        return {
+            'ok': True,
+            'provider': 'Kiwoom OpenAPI+ opt10032',
+            'updatedAt': now_iso(),
+            'exchangeType': EXCHANGE_TYPE,
+            'exchangeTypeLabel': EXCHANGE_TYPE_LABEL,
+            'criteria': {
+                'rank': 'daily-trade-amount',
+                'limit': limit,
+                'markets': MARKETS,
+            },
+            'items': items,
+            'stats': {
+                'count': len(items),
+                'totalTradeAmountMillion': sum(int(item.get('tradeAmountMillion') or 0) for item in items),
+            },
+        }
+
     def _request_current_quote(self, code: str) -> Optional[Dict[str, Any]]:
         normalized_code = clean_code(code)
         candidate = self.candidates.get(normalized_code, {})
@@ -983,6 +1028,11 @@ def debug_code(code: str) -> Dict[str, Any]:
 def ranking_debug(code: str) -> Dict[str, Any]:
     normalized_code = clean_code(code)
     return run_controller_call(lambda: controller.ranking_debug(normalized_code), 90)
+
+
+@api.get('/daily-amount-rank')
+def daily_amount_rank(limit: int = 50) -> Dict[str, Any]:
+    return run_controller_call(lambda: controller.daily_amount_rank(max(1, min(int(limit or 50), 100))), 90)
 
 
 @api.get('/stock/{code}')

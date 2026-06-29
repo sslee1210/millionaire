@@ -134,6 +134,30 @@ app.get('/api/ranking-debug/:code', async (req, res) => {
   res.status(bridge.ok ? 200 : 503).json(bridge);
 });
 
+app.get('/api/daily-amount-rank', async (req, res) => {
+  const limit = Math.max(1, Math.min(toInt(req.query.limit, 50), 100));
+  const bridge = await bridgeJson(`/daily-amount-rank?limit=${limit}`, {}, 120000);
+  if (bridge.ok) return res.json(normalizeDailyAmountRankPayload(bridge));
+
+  const snapshot = await fetchSnapshot({
+    sectorLimit: 50,
+    stocksPerSector: 20,
+    maxRealtimeCodes: DEFAULT_MAX_REALTIME_CODES,
+    sort: 'tradeAmount',
+  });
+  const rows = flattenSnapshotStocks(snapshot)
+    .sort((a, b) => Number(b.tradeAmountMillion || 0) - Number(a.tradeAmountMillion || 0))
+    .slice(0, limit)
+    .map((row, index) => ({ ...row, rank: index + 1, sourceLabel: row.sourceLabel || '스냅샷 대체' }));
+  res.status(snapshot.ok ? 200 : 503).json(normalizeDailyAmountRankPayload({
+    ok: Boolean(snapshot.ok),
+    provider: 'Kiwoom snapshot fallback',
+    updatedAt: snapshot.updatedAt,
+    items: rows,
+    message: bridge.error || bridge.message || '키움 거래대금순 TR을 불러오지 못해 현재 스냅샷으로 대체했습니다.',
+  }));
+});
+
 app.get('/api/stream', async (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -322,6 +346,30 @@ function normalizeScreenerPayload(payload) {
     items: rows,
     stats: payload.stats || screenerStats(rows),
     message: payload.message || null,
+  };
+}
+
+function normalizeDailyAmountRankPayload(payload) {
+  const rows = Array.isArray(payload.items) ? payload.items : [];
+  const items = rows.map((row, index) => ({
+    ...row,
+    rank: Number(row.rank || row.amountRank || index + 1),
+    sector: row.sector || '미분류',
+    tradeAmountMillion: Number(row.tradeAmountMillion || 0),
+    volume: Number(row.volume || 0),
+    sourceLabel: row.sourceLabel || '키움거래대금순TR',
+  }));
+  return {
+    ok: Boolean(payload.ok),
+    provider: payload.provider || 'Kiwoom OpenAPI+ opt10032',
+    updatedAt: payload.updatedAt || new Date().toISOString(),
+    criteria: payload.criteria || { rank: 'daily-trade-amount' },
+    items,
+    stats: payload.stats || {
+      count: items.length,
+      totalTradeAmountMillion: items.reduce((sum, item) => sum + Number(item.tradeAmountMillion || 0), 0),
+    },
+    message: payload.message || payload.error || null,
   };
 }
 

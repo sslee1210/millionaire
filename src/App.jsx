@@ -34,6 +34,8 @@ export default function App() {
 
 function DashboardPage() {
   const [snapshot, setSnapshot] = useState(DEFAULT_SNAPSHOT);
+  const [dailyRank, setDailyRank] = useState({ ok: false, items: [], stats: {} });
+  const [dailyRankLoading, setDailyRankLoading] = useState(false);
   const [boardMode, setBoardMode] = useState('sector');
   const [sort, setSort] = useState('tradeAmount');
   const [sectorFilter, setSectorFilter] = useState('all');
@@ -72,19 +74,36 @@ function DashboardPage() {
   }, [snapshot]);
 
   useEffect(() => {
+    if (boardMode !== 'daily') return;
+    let cancelled = false;
+    setDailyRankLoading(true);
+    fetchJson('/api/daily-amount-rank?limit=50')
+      .then((next) => {
+        if (!cancelled) setDailyRank(next);
+      })
+      .catch((error) => {
+        if (!cancelled) setDailyRank({ ok: false, items: [], stats: {}, message: String(error.message || error) });
+      })
+      .finally(() => {
+        if (!cancelled) setDailyRankLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [boardMode, streamRevision]);
+
+  useEffect(() => {
     if (sectorFilter !== 'all' && !sectors.some((sector) => sector.name === sectorFilter)) {
       setSectorFilter('all');
     }
   }, [sectorFilter, sectors]);
 
   const stocks = useMemo(() => flattenStocks(sectors), [sectors]);
-  const dailyRankRows = useMemo(() => sortDashboardStocks(stocks, 'tradeAmount').slice(0, 20), [stocks]);
+  const dailyRankRows = useMemo(() => dailyRank.items || [], [dailyRank]);
   const tableRows = useMemo(() => {
-    let rows = [...stocks];
+    let rows = boardMode === 'daily' ? [...dailyRankRows] : [...stocks];
     if (sectorFilter !== 'all') rows = rows.filter((stock) => stock.sector === sectorFilter);
     rows = sortDashboardStocks(rows, sort);
     return rows.slice(0, top20Only ? 20 : 100);
-  }, [stocks, sectorFilter, sort, top20Only]);
+  }, [stocks, dailyRankRows, boardMode, sectorFilter, sort, top20Only]);
 
   const stats = useMemo(() => {
     const totalTradeAmount = sectors.reduce((sum, sector) => sum + number(sector.tradeAmountMillion), 0);
@@ -93,9 +112,7 @@ function DashboardPage() {
       .sort((a, b) => number(b.tradeAmountMillion) - number(a.tradeAmountMillion))
       .slice(0, 100)
       .reduce((sum, stock) => sum + number(stock.tradeAmountMillion), 0);
-    const top20TradeAmount = stocks
-      .slice()
-      .sort((a, b) => number(b.tradeAmountMillion) - number(a.tradeAmountMillion))
+    const top20TradeAmount = dailyRankRows
       .slice(0, 20)
       .reduce((sum, stock) => sum + number(stock.tradeAmountMillion), 0);
     return {
@@ -105,7 +122,7 @@ function DashboardPage() {
       upCount: stocks.filter((stock) => number(stock.changeRate) > 0).length,
       downCount: stocks.filter((stock) => number(stock.changeRate) < 0).length,
     };
-  }, [sectors, stocks]);
+  }, [sectors, stocks, dailyRankRows]);
 
   const manualRefresh = async () => {
     setStatus('connecting');
@@ -166,7 +183,7 @@ function DashboardPage() {
           <div className="section-heading">
             <h2>{boardMode === 'daily' ? '일일 거래대금순' : '섹터별 거래대금'}</h2>
             <div className="section-actions">
-              <span>{boardMode === 'daily' ? '키움 당일 누적 거래대금 TOP 종목' : '거래대금 상위 섹터와 대표 종목'}</span>
+              <span>{boardMode === 'daily' ? '키움 거래대금상위 TR 기준' : '거래대금 상위 섹터와 대표 종목'}</span>
               <div className="segmented small">
                 <button className={boardMode === 'sector' ? 'active' : ''} type="button" onClick={() => changeBoardMode('sector')}>섹터 보기</button>
                 <button className={boardMode === 'daily' ? 'active' : ''} type="button" onClick={() => changeBoardMode('daily')}>일일 거래대금순</button>
@@ -176,8 +193,8 @@ function DashboardPage() {
           {boardMode === 'daily' ? (
             <section className="daily-rank-grid" aria-label="일일 거래대금 순위">
               {dailyRankRows.length ? dailyRankRows.map((stock, index) => (
-                <DailyRankCard key={`${stock.code}-${stock.sector}`} stock={stock} rank={index + 1} />
-              )) : <EmptyPanel text="키움 당일 거래대금 순위 수신 대기 중입니다." />}
+                <DailyRankCard key={`${stock.code}-${stock.sector}`} stock={stock} rank={stock.rank || index + 1} />
+              )) : <EmptyPanel text={dailyRankLoading ? '키움 거래대금상위 TR을 조회하는 중입니다.' : '키움 거래대금상위 순위를 불러오지 못했습니다.'} />}
             </section>
           ) : (
             <section className="sector-grid" aria-label="섹터별 거래대금 보드">
@@ -194,7 +211,7 @@ function DashboardPage() {
           )}
 
           <section className="legend-row">
-            <span>{boardMode === 'daily' ? '일일 거래대금순: 키움 당일 누적 거래대금 기준' : '섹터 강도: 거래대금 · 등락률 · 순매수 기준'}</span>
+            <span>{boardMode === 'daily' ? `일일 거래대금순: ${providerText(dailyRank.provider || 'Kiwoom OpenAPI+ opt10032')} · ${dailyRank.updatedAt ? timeText(dailyRank.updatedAt) : '조회 대기'}` : '섹터 강도: 거래대금 · 등락률 · 순매수 기준'}</span>
             <span>급증: 1분/3분 거래대금 {fmtTradeAmount(snapshot.stats?.flowAlertThresholdMillion || 1000)} 이상</span>
           </section>
 
@@ -864,6 +881,7 @@ function providerText(value) {
   const text = String(value || 'Kiwoom OpenAPI+');
   return text
     .replace('Kiwoom OpenAPI+ only', 'Kiwoom OpenAPI+')
+    .replace('Kiwoom OpenAPI+ opt10032', '키움 거래대금상위 TR')
     .replace('Kiwoom OpenAPI+ snapshot fallback', 'Kiwoom 스냅샷')
     .replace('Kiwoom OpenAPI+ opt10081', '키움 일봉 TR')
     .replace('Kiwoom OpenAPI+ debug', '키움 디버그');
